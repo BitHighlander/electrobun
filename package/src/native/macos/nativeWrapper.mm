@@ -1302,6 +1302,14 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray, CGFloat
     - (void)toggleMirrorMode:(BOOL)enable {
         NSView *subview = self.nsView;
 
+        // In displayLayer mode (overlay), the CEFOSRView's visual output comes
+        // from the standalone CALayer, not the NSView's backing store. Skip all
+        // frame manipulation — the view stays at its current position for event
+        // routing, and its alphaValue=0 prevents stale content from showing.
+        if ([subview isKindOfClass:[CEFOSRView class]] && ((CEFOSRView *)subview).displayLayer) {
+            return;
+        }
+
         if (self.mirrorModeEnabled == enable) {
             return;
         }
@@ -1557,7 +1565,72 @@ static void schedulePendingResizeDrain() {
         [self addTrackingArea:mouseTrackingArea];
     }
 
-    - (void)mouseMoved:(NSEvent *)event {    
+    // Find CEFOSRView in overlay mode (removed from subviews, displayLayer active)
+    - (CEFOSRView *)overlayOSRView {
+        for (AbstractView *av in self.abstractViews) {
+            if ([av.nsView isKindOfClass:[CEFOSRView class]]) {
+                CEFOSRView *osrView = (CEFOSRView *)av.nsView;
+                if (osrView.displayLayer) return osrView;
+            }
+        }
+        return nil;
+    }
+
+    - (void)mouseDown:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr mouseDown:event]; return; }
+        [super mouseDown:event];
+    }
+
+    - (void)mouseUp:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr mouseUp:event]; return; }
+        [super mouseUp:event];
+    }
+
+    - (void)rightMouseDown:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr rightMouseDown:event]; return; }
+        [super rightMouseDown:event];
+    }
+
+    - (void)rightMouseUp:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr rightMouseUp:event]; return; }
+        [super rightMouseUp:event];
+    }
+
+    - (void)mouseDragged:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr mouseDragged:event]; return; }
+        [super mouseDragged:event];
+    }
+
+    - (void)scrollWheel:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr scrollWheel:event]; return; }
+        [super scrollWheel:event];
+    }
+
+    - (void)keyDown:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr keyDown:event]; return; }
+        [super keyDown:event];
+    }
+
+    - (void)keyUp:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr keyUp:event]; return; }
+        [super keyUp:event];
+    }
+
+    - (BOOL)acceptsFirstResponder { return YES; }
+
+    - (void)mouseMoved:(NSEvent *)event {
+        // Forward mouse move to overlay OSR view for hover effects
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) [osr mouseMoved:event];
+
         NSPoint mouseLocation = [self convertPoint:[event locationInWindow] fromView:nil];
         [self updateActiveWebviewForMousePosition:mouseLocation];
     }
@@ -1831,6 +1904,17 @@ static void schedulePendingResizeDrain() {
 
 - (void)drawRect:(NSRect)dirtyRect {
     NSLog(@"DEBUG OSR drawRect: Enter");
+
+    // When displayLayer is active, the CALayer handles visual compositing.
+    // This view's drawRect should only clear to transparent so it doesn't
+    // paint stale content (e.g. loading screen) over the GPU scene.
+    if (self.displayLayer) {
+        CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+        if (ctx) CGContextClearRect(ctx, self.bounds);
+        NSLog(@"DEBUG OSR drawRect: displayLayer active, cleared to transparent");
+        return;
+    }
+
     [_bufferLock lock];
 
     if (!_pixelBuffer || _bufferWidth == 0 || _bufferHeight == 0) {
@@ -3263,13 +3347,41 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                 if (!hasCEFOSR) {
                     [window makeFirstResponder:view];
                 } else {
-                    // In overlay mode (CEF + WGPU), the WGPUView should pass through
-                    // all mouse events so the CEFOSRView (React UI) receives them.
-                    // Game input comes via WebSocket, not native mouse events.
+                    // Overlay mode: CEF + WGPU coexist in the same window.
+
+                    // 1. Mouse passthrough: WGPUView yields all mouse events to CEFOSRView
                     self.isMousePassthroughEnabled = YES;
-                    // Also set the native view's hitTest passthrough
                     if ([view isKindOfClass:[WGPUInputView class]]) {
                         ((WGPUInputView *)view).mousePassthrough = YES;
+                    }
+
+                    // 2. Switch CEFOSRView to displayLayer mode: CEF pixels render into
+                    //    a standalone CALayer that composites above CAMetalLayer correctly.
+                    //    This is deferred to here (not at CEFWebView init) so that pre-game
+                    //    screens (loading, character select) render via drawRect normally.
+                    for (NSView *sibling in window.contentView.subviews) {
+                        if ([sibling isKindOfClass:[CEFOSRView class]]) {
+                            CEFOSRView *osrView = (CEFOSRView *)sibling;
+                            if (!osrView.displayLayer) {
+                                CALayer *osrLayer = [CALayer layer];
+                                osrLayer.frame = window.contentView.layer.bounds;
+                                osrLayer.zPosition = 1000;
+                                osrLayer.opaque = NO;
+                                osrLayer.backgroundColor = [[NSColor clearColor] CGColor];
+                                osrLayer.contentsGravity = kCAGravityResize;
+                                osrLayer.contentsScale = window.backingScaleFactor;
+                                [window.contentView.layer addSublayer:osrLayer];
+                                osrView.displayLayer = osrLayer;
+                                // Remove the OSR view from the subview hierarchy entirely
+                                // so its stale backing store can never show through.
+                                // Mouse events are forwarded from ContainerView → CEFOSRView
+                                // via the abstractViews array (the view doesn't need to be
+                                // a subview to receive forwarded sendMouseEvent calls).
+                                [osrView removeFromSuperview];
+                                NSLog(@"Overlay mode: CEFOSRView removed from subviews, using displayLayer");
+                            }
+                            break;
+                        }
                     }
                 }
 
@@ -6135,26 +6247,12 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
                 if (transparent) {
                     self.isOSRMode = YES;
 
-                    // Create CEFOSRView but DON'T add it as a subview.
-                    // It serves as the buffer manager + CEF event forwarder.
+                    // Create CEFOSRView and add as subview for rendering + event routing.
+                    // Pre-game screens (loading, character select) render via drawRect normally.
+                    // When a WGPUView is later created by <electrobun-wgpu>, we switch to
+                    // displayLayer mode so CEF composites above the CAMetalLayer correctly.
                     NSRect osrFrame = NSMakeRect(frame.origin.x, adjustedY, frame.size.width, frame.size.height);
                     self.osrView = [[CEFOSRView alloc] initWithFrame:osrFrame];
-
-                    // Instead, create a regular CALayer for displaying the CEF content.
-                    // This layer composites correctly with CAMetalLayer via zPosition.
-                    CALayer *osrLayer = [CALayer layer];
-                    osrLayer.frame = CGRectMake(0, 0, frame.size.width, frame.size.height);
-                    osrLayer.zPosition = 1000;
-                    osrLayer.opaque = NO;
-                    osrLayer.backgroundColor = [[NSColor clearColor] CGColor];
-                    osrLayer.contentsGravity = kCAGravityResize;
-                    osrLayer.contentsScale = window.backingScaleFactor;
-                    [contentView.layer addSublayer:osrLayer];
-                    self.osrView.displayLayer = osrLayer;
-
-                    // Add the OSR view as a subview for mouse/keyboard event routing.
-                    // It still draws via drawRect (for event routing to work correctly),
-                    // AND the displayLayer CALayer draws on top of Metal for correct compositing.
                     [contentView addSubview:self.osrView positioned:NSWindowAbove relativeTo:nil];
                     self.nsView = self.osrView;
                     writeNativeViewDebugSnapshot(window, @"after-cef-osr-init");
