@@ -1944,7 +1944,11 @@ static void schedulePendingResizeDrain() {
     }
 }
 
-- (void)mouseDown:(NSEvent*)event { [self sendMouseEvent:event type:1]; }
+- (void)mouseDown:(NSEvent*)event {
+    NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
+    NSLog(@"DEBUG CEFOSRView mouseDown at (%.0f, %.0f)", point.x, point.y);
+    [self sendMouseEvent:event type:1];
+}
 - (void)mouseUp:(NSEvent*)event { [self sendMouseEvent:event type:2]; }
 - (void)mouseMoved:(NSEvent*)event { [self sendMouseEvent:event type:0]; }
 - (void)mouseDragged:(NSEvent*)event { [self sendMouseEvent:event type:0]; }
@@ -3097,9 +3101,18 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
 
 // ----------------------- WGPUViewImpl -----------------------
 @interface WGPUInputView : NSView
+@property (nonatomic, assign) BOOL mousePassthrough;
 @end
 
 @implementation WGPUInputView
+
+// When mousePassthrough is enabled, this view is invisible to hit testing.
+// Mouse events pass through to the CEFOSRView behind it.
+- (NSView *)hitTest:(NSPoint)point {
+    if (self.mousePassthrough) return nil;
+    return [super hitTest:point];
+}
+
     - (uint32_t)modifierMaskFromEvent:(NSEvent*)event {
         uint32_t mods = 0;
         if ([event modifierFlags] & NSEventModifierFlagShift) mods |= 1 << 0;
@@ -3237,7 +3250,28 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
 
                 writeNativeViewDebugSnapshot(window, @"after-wgpu-view-init");
 
-                [window makeFirstResponder:view];
+                // Only make WGPUInputView first responder if there's no CEFOSRView.
+                // When both exist (overlay mode), the CEFOSRView must stay first
+                // responder so the React UI receives mouse/keyboard events.
+                BOOL hasCEFOSR = NO;
+                for (NSView *sibling in window.contentView.subviews) {
+                    if ([sibling isKindOfClass:[CEFOSRView class]]) {
+                        hasCEFOSR = YES;
+                        break;
+                    }
+                }
+                if (!hasCEFOSR) {
+                    [window makeFirstResponder:view];
+                } else {
+                    // In overlay mode (CEF + WGPU), the WGPUView should pass through
+                    // all mouse events so the CEFOSRView (React UI) receives them.
+                    // Game input comes via WebSocket, not native mouse events.
+                    self.isMousePassthroughEnabled = YES;
+                    // Also set the native view's hitTest passthrough
+                    if ([view isKindOfClass:[WGPUInputView class]]) {
+                        ((WGPUInputView *)view).mousePassthrough = YES;
+                    }
+                }
 
                 if (self.pendingStartTransparent) {
                     window.opaque = NO;
@@ -6118,9 +6152,9 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
                     [contentView.layer addSublayer:osrLayer];
                     self.osrView.displayLayer = osrLayer;
 
-                    // Still add the OSR view as a subview for mouse/keyboard event routing,
-                    // but make it fully transparent (no drawing — the CALayer does that).
-                    self.osrView.layer.opacity = 0;
+                    // Add the OSR view as a subview for mouse/keyboard event routing.
+                    // It still draws via drawRect (for event routing to work correctly),
+                    // AND the displayLayer CALayer draws on top of Metal for correct compositing.
                     [contentView addSubview:self.osrView positioned:NSWindowAbove relativeTo:nil];
                     self.nsView = self.osrView;
                     writeNativeViewDebugSnapshot(window, @"after-cef-osr-init");
