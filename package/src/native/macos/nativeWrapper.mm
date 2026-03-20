@@ -24,6 +24,119 @@ static bool wgpuDebugEnabled() {
     cached = (val && strcmp(val, "1") == 0) ? 1 : 0;
     return cached == 1;
 }
+
+static NSString* debugViewDumpPath() {
+    const char* path = getenv("ELECTROBUN_DEBUG_VIEWS_FILE");
+    if (!path || path[0] == '\0') return @"/tmp/electrobun-native-views.json";
+    return [NSString stringWithUTF8String:path];
+}
+
+static NSDictionary* serializeViewForDebug(NSView* view) {
+    NSMutableDictionary* info = [NSMutableDictionary dictionary];
+    info[@"className"] = NSStringFromClass([view class]) ?: @"<unknown>";
+    info[@"frame"] = @{
+        @"x": @(view.frame.origin.x),
+        @"y": @(view.frame.origin.y),
+        @"width": @(view.frame.size.width),
+        @"height": @(view.frame.size.height),
+    };
+    info[@"hidden"] = @(view.hidden);
+    if (view.layer) {
+        info[@"zPosition"] = @(view.layer.zPosition);
+        info[@"opaque"] = @(view.layer.opaque);
+    } else {
+        info[@"zPosition"] = [NSNull null];
+        info[@"opaque"] = [NSNull null];
+    }
+    return info;
+}
+
+static void writeNativeViewDebugSnapshot(NSWindow* window, NSString* stage) {
+    NSString* path = debugViewDumpPath();
+    if (!path || !window.contentView) {
+        NSLog(@"Electrobun native debug snapshot skipped: missing path or contentView at stage %@", stage);
+        return;
+    }
+
+    NSMutableArray* views = [NSMutableArray array];
+    for (NSView* subview in window.contentView.subviews) {
+        [views addObject:serializeViewForDebug(subview)];
+    }
+
+    NSDictionary* payload = @{
+        @"stage": stage ?: @"<unknown>",
+        @"contentViewClass": NSStringFromClass([window.contentView class]) ?: @"<unknown>",
+        @"contentBounds": @{
+            @"x": @(window.contentView.bounds.origin.x),
+            @"y": @(window.contentView.bounds.origin.y),
+            @"width": @(window.contentView.bounds.size.width),
+            @"height": @(window.contentView.bounds.size.height),
+        },
+        @"subviews": views,
+    };
+
+    NSError* error = nil;
+    NSData* json = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingPrettyPrinted error:&error];
+    if (!json || error) {
+        NSLog(@"Electrobun native debug snapshot JSON error at stage %@: %@", stage, error);
+        return;
+    }
+    BOOL ok = [json writeToFile:path atomically:YES];
+    NSLog(@"Electrobun native debug snapshot %@ at %@ (%@)", ok ? @"wrote" : @"failed", path, stage);
+}
+
+static void writeOSRBufferDebugSnapshot(const void* buffer, int width, int height) {
+    if (!buffer || width <= 0 || height <= 0) return;
+    const uint8_t* bytes = (const uint8_t*)buffer;
+    int stepX = MAX(width / 32, 1);
+    int stepY = MAX(height / 32, 1);
+    int nonZeroAlphaSamples = 0;
+    int totalSamples = 0;
+    int maxAlpha = 0;
+
+    for (int y = 0; y < height; y += stepY) {
+        for (int x = 0; x < width; x += stepX) {
+            size_t idx = ((size_t)y * (size_t)width + (size_t)x) * 4;
+            int alpha = bytes[idx + 3];
+            totalSamples += 1;
+            if (alpha > 0) nonZeroAlphaSamples += 1;
+            if (alpha > maxAlpha) maxAlpha = alpha;
+        }
+    }
+
+    auto samplePixel = ^NSDictionary* (int x, int y) {
+        x = MAX(0, MIN(x, width - 1));
+        y = MAX(0, MIN(y, height - 1));
+        size_t idx = ((size_t)y * (size_t)width + (size_t)x) * 4;
+        return @{
+            @"x": @(x),
+            @"y": @(y),
+            @"b": @(bytes[idx + 0]),
+            @"g": @(bytes[idx + 1]),
+            @"r": @(bytes[idx + 2]),
+            @"a": @(bytes[idx + 3]),
+        };
+    };
+
+    NSDictionary* payload = @{
+        @"width": @(width),
+        @"height": @(height),
+        @"nonZeroAlphaSamples": @(nonZeroAlphaSamples),
+        @"totalSamples": @(totalSamples),
+        @"maxAlpha": @(maxAlpha),
+        @"samples": @{
+            @"topLeft": samplePixel(4, 4),
+            @"hudProbe": samplePixel(40, 40),
+            @"center": samplePixel(width / 2, height / 2),
+            @"bottomLeft": samplePixel(40, MAX(height - 40, 0)),
+        }
+    };
+
+    NSError* error = nil;
+    NSData* json = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingPrettyPrinted error:&error];
+    if (!json || error) return;
+    [json writeToFile:@"/tmp/electrobun-osr-buffer.json" atomically:YES];
+}
 #import <UserNotifications/UserNotifications.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -801,6 +914,9 @@ static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews = ni
 }
 @property (nonatomic, assign) void* cefBrowser;  // CefRefPtr<CefBrowser> stored as void*
 @property (nonatomic, strong) NSTrackingArea *trackingArea;
+/// When set, CEF pixel data is rendered into this CALayer (as CGImage contents)
+/// instead of drawRect. Used to composite above CAMetalLayer via layer z-ordering.
+@property (nonatomic, strong) CALayer *displayLayer;
 
 - (void)updateBuffer:(const void*)buffer width:(int)width height:(int)height;
 - (void)setCefBrowser:(void*)browser;
@@ -1176,7 +1292,9 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray, CGFloat
     - (void)setTransparent:(BOOL)transparent {
         if (self.nsView) {
             [self.nsView setWantsLayer:YES];
-            self.nsView.layer.opacity = transparent ? 0 : 1;
+            self.nsView.layer.opacity = 1;
+            self.nsView.layer.backgroundColor = [[NSColor clearColor] CGColor];
+            self.nsView.layer.opaque = !transparent ? YES : NO;
         }
     }
 
@@ -1493,7 +1611,15 @@ static void schedulePendingResizeDrain() {
 
 
     - (void)addAbstractView:(AbstractView *)abstractView {
-        // Add to front of array so it's top-most first
+        // Keep browser-backed surfaces above native WGPU surfaces for the
+        // single-window "HTML overlay over GPU scene" use case.
+        Class wgpuInputViewClass = NSClassFromString(@"WGPUInputView");
+        if (wgpuInputViewClass && abstractView.nsView && [abstractView.nsView isKindOfClass:wgpuInputViewClass]) {
+            [self.abstractViews addObject:abstractView];
+            return;
+        }
+
+        // Add browser/OSR-backed surfaces to the front so they win hit testing.
         [self.abstractViews insertObject:abstractView atIndex:0];
     }
 
@@ -1575,6 +1701,10 @@ static void schedulePendingResizeDrain() {
     return YES;  // CEF uses top-left origin
 }
 
+- (BOOL)isOpaque {
+    return NO;
+}
+
 - (BOOL)acceptsFirstResponder {
     return YES;
 }
@@ -1634,6 +1764,7 @@ static void schedulePendingResizeDrain() {
 
     NSLog(@"DEBUG OSR updateBuffer: About to memcpy %zu bytes", requiredSize);
     memcpy(_pixelBuffer, buffer, requiredSize);
+    writeOSRBufferDebugSnapshot(buffer, width, height);
     _bufferWidth = width;
     _bufferHeight = height;
     _hasNewFrame = YES;
@@ -1641,11 +1772,61 @@ static void schedulePendingResizeDrain() {
     [_bufferLock unlock];
     NSLog(@"DEBUG OSR updateBuffer: Lock released, requesting redraw");
 
-    // Request redraw on main thread
+    // Update display target — either CALayer (overlay mode) or NSView drawRect
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self setNeedsDisplay:YES];
+        if (self.displayLayer) {
+            // Render into the standalone CALayer (composites above CAMetalLayer)
+            [self updateDisplayLayer];
+        } else {
+            // Standard path: request NSView redraw
+            [self setNeedsDisplay:YES];
+        }
     });
     NSLog(@"DEBUG OSR updateBuffer: Exit");
+}
+
+- (void)updateDisplayLayer {
+    [_bufferLock lock];
+
+    if (!_pixelBuffer || _bufferWidth == 0 || _bufferHeight == 0) {
+        [_bufferLock unlock];
+        return;
+    }
+
+    int width = _bufferWidth;
+    int height = _bufferHeight;
+    size_t bufferSize = (size_t)width * (size_t)height * 4;
+
+    // Copy pixel data so we can release lock quickly
+    void *copyBuf = malloc(bufferSize);
+    if (!copyBuf) { [_bufferLock unlock]; return; }
+    memcpy(copyBuf, _pixelBuffer, bufferSize);
+    _hasNewFrame = NO;
+
+    [_bufferLock unlock];
+
+    // Create CGImage from pixel buffer (BGRA premultiplied alpha)
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bitmapContext = CGBitmapContextCreate(
+        copyBuf, width, height, 8, width * 4, colorSpace,
+        (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+    );
+
+    if (bitmapContext) {
+        CGImageRef image = CGBitmapContextCreateImage(bitmapContext);
+        if (image) {
+            // Set as CALayer contents — Core Animation composites via zPosition
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            self.displayLayer.contents = (__bridge id)image;
+            self.displayLayer.transform = CATransform3DIdentity;
+            [CATransaction commit];
+            CGImageRelease(image);
+        }
+        CGContextRelease(bitmapContext);
+    }
+    CGColorSpaceRelease(colorSpace);
+    free(copyBuf);
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
@@ -1685,6 +1866,8 @@ static void schedulePendingResizeDrain() {
         NSLog(@"DEBUG OSR drawRect: No context, returning");
         return;
     }
+
+    CGContextClearRect(context, self.bounds);
 
     NSLog(@"DEBUG OSR drawRect: Creating bitmap context %dx%d", width, height);
 
@@ -3030,9 +3213,30 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                     self.fullSize = NO;
                 }
 
-                [window.contentView addSubview:view positioned:NSWindowAbove relativeTo:nil];
+                // WGPU tag surfaces should sit beneath browser-backed surfaces so
+                // transparent HTML/CSS UI can render above the native GPU scene.
+                [window.contentView addSubview:view positioned:NSWindowBelow relativeTo:nil];
+                if (view.layer) {
+                    view.layer.zPosition = -1000;
+                }
                 CGFloat adjustedY = window.contentView.bounds.size.height - frame.origin.y - frame.size.height;
                 view.frame = NSMakeRect(frame.origin.x, adjustedY, frame.size.width, frame.size.height);
+
+                // Make the ordering explicit for the transparent BrowserWindow / CEF OSR path:
+                // any browser-backed surface should be re-raised above the WGPU surface.
+                for (NSView *sibling in window.contentView.subviews) {
+                    if (sibling == view) continue;
+                    if ([sibling isKindOfClass:[WKWebView class]] || [sibling isKindOfClass:[CEFOSRView class]]) {
+                        [sibling removeFromSuperview];
+                        [window.contentView addSubview:sibling positioned:NSWindowAbove relativeTo:view];
+                        if (sibling.layer) {
+                            sibling.layer.zPosition = 1000;
+                        }
+                    }
+                }
+
+                writeNativeViewDebugSnapshot(window, @"after-wgpu-view-init");
+
                 [window makeFirstResponder:view];
 
                 if (self.pendingStartTransparent) {
@@ -3081,7 +3285,7 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
         if (!self.nsView) return;
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.nsView setWantsLayer:YES];
-            self.nsView.layer.opacity = transparent ? 0 : 1;
+            self.nsView.layer.opacity = 1;
             self.nsView.layer.backgroundColor = [[NSColor clearColor] CGColor];
             self.nsView.layer.opaque = !transparent ? YES : NO;
             if ([self.nsView.layer isKindOfClass:[CAMetalLayer class]]) {
@@ -5885,17 +6089,43 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
                                 (int)frame.size.width,
                                 (int)frame.size.height);
 
-                // Use OSR (windowless) mode for transparent windows
+                // Use OSR (windowless) mode for transparent windows.
+                // CEFOSRView draws the browser content via drawRect (software rendering).
+                // WGPUView uses CAMetalLayer (hardware). CAMetalLayer ignores zPosition
+                // when compositing against sibling view layers.
+                //
+                // Fix: Don't use CEFOSRView as an NSView in the subview hierarchy.
+                // Instead, use a CALayer that we manually update from OnPaint pixel data.
+                // This CALayer is added as a sublayer of contentView.layer with high zPosition.
+                // CALayer-to-CALayer z-ordering works correctly, even with CAMetalLayer siblings.
                 if (transparent) {
                     self.isOSRMode = YES;
-                    // Create OSR view
+
+                    // Create CEFOSRView but DON'T add it as a subview.
+                    // It serves as the buffer manager + CEF event forwarder.
                     NSRect osrFrame = NSMakeRect(frame.origin.x, adjustedY, frame.size.width, frame.size.height);
                     self.osrView = [[CEFOSRView alloc] initWithFrame:osrFrame];
-                    [contentView addSubview:self.osrView];
+
+                    // Instead, create a regular CALayer for displaying the CEF content.
+                    // This layer composites correctly with CAMetalLayer via zPosition.
+                    CALayer *osrLayer = [CALayer layer];
+                    osrLayer.frame = CGRectMake(0, 0, frame.size.width, frame.size.height);
+                    osrLayer.zPosition = 1000;
+                    osrLayer.opaque = NO;
+                    osrLayer.backgroundColor = [[NSColor clearColor] CGColor];
+                    osrLayer.contentsGravity = kCAGravityResize;
+                    osrLayer.contentsScale = window.backingScaleFactor;
+                    [contentView.layer addSublayer:osrLayer];
+                    self.osrView.displayLayer = osrLayer;
+
+                    // Still add the OSR view as a subview for mouse/keyboard event routing,
+                    // but make it fully transparent (no drawing — the CALayer does that).
+                    self.osrView.layer.opacity = 0;
+                    [contentView addSubview:self.osrView positioned:NSWindowAbove relativeTo:nil];
                     self.nsView = self.osrView;
+                    writeNativeViewDebugSnapshot(window, @"after-cef-osr-init");
 
                     // Use windowless (off-screen) rendering for transparency
-                    // Pass the window handle for context menu positioning, etc.
                     window_info.SetAsWindowless((__bridge void*)window);
                 } else {
                     self.isOSRMode = NO;
@@ -6354,11 +6584,14 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
             self.focusHandler(self.windowId);
         }
 
-        // Prefer WGPU input view as first responder so key events reach GPU windows.
+        // Prefer the top-most interactive surface as first responder. For single-window
+        // BrowserWindow + WGPUView composition this keeps the HTML/webview layer above
+        // the native GPU view both visually and for text/key focus.
         NSWindow *window = [notification object];
         ContainerView *containerView = [window contentView];
         for (AbstractView *abstractView in containerView.abstractViews) {
-            if (abstractView.nsView && [abstractView.nsView isKindOfClass:[WGPUInputView class]]) {
+            if (abstractView.isMousePassthroughEnabled) continue;
+            if (abstractView.nsView && !abstractView.nsView.hidden) {
                 [window makeFirstResponder:abstractView.nsView];
                 break;
             }
