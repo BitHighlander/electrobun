@@ -2923,12 +2923,6 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
         uint32_t webviewIdForLogging = self.webviewId;
         WKWebView *webViewToClean = self.webView;
 
-        // Keep native tracking consistent even if this remove path is called
-        // directly instead of going through webviewRemove().
-        if (globalAbstractViews) {
-            [globalAbstractViews removeObjectForKey:@(self.webviewId)];
-        }
-
         // Dispatch all cleanup to main queue since WKWebView operations require it
         dispatch_async(dispatch_get_main_queue(), ^{
             [webViewToClean stopLoading];
@@ -3355,11 +3349,10 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                         ((WGPUInputView *)view).mousePassthrough = YES;
                     }
 
-                    // 2. Switch CEFOSRView to displayLayer mode: CEF pixels render into
-                    //    a standalone CALayer that composites above CAMetalLayer correctly.
-                    //    This is deferred to here (not at CEFWebView init) so that pre-game
-                    //    screens (loading, character select) render via drawRect normally.
-                    for (NSView *sibling in window.contentView.subviews) {
+                    // 2. Switch CEFOSRView to displayLayer mode
+                    NSLog(@"Overlay mode: searching %lu subviews for CEFOSRView", (unsigned long)window.contentView.subviews.count);
+                    for (NSView *sibling in [window.contentView.subviews copy]) {
+                        NSLog(@"  subview: %@ (%@)", NSStringFromClass([sibling class]), sibling == view ? @"self" : @"other");
                         if ([sibling isKindOfClass:[CEFOSRView class]]) {
                             CEFOSRView *osrView = (CEFOSRView *)sibling;
                             if (!osrView.displayLayer) {
@@ -7128,12 +7121,108 @@ extern "C" void* wgpuViewGetNativeHandle(AbstractView *abstractView) {
     return result;
 }
 
+// Capture BGRA pixels from the WGPUView's CAMetalLayer using Metal texture readback.
+// Grabs a new drawable, blits the layer's framebuffer into a CPU-readable texture, and
+// returns: [4 bytes width LE][4 bytes height LE][width*height*4 BGRA bytes]
+// The caller converts BGRA→RGBA if needed. Caller must free the returned pointer.
+// Returns nullptr on failure.
+extern "C" void* wgpuViewCapturePixels(AbstractView *abstractView) {
+    if (!abstractView) return nullptr;
+    __block void* result = nullptr;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        if (!abstractView.nsView) return;
+        CALayer *layer = abstractView.nsView.layer;
+        if (![layer isKindOfClass:[CAMetalLayer class]]) return;
+        CAMetalLayer *metalLayer = (CAMetalLayer *)layer;
+
+        id<MTLDevice> device = metalLayer.device;
+        if (!device) return;
+
+        // Use actual layer drawable size (not fixed 512x512)
+        uint32_t w = (uint32_t)metalLayer.drawableSize.width;
+        uint32_t h = (uint32_t)metalLayer.drawableSize.height;
+        if (w == 0 || h == 0) return;
+
+        // Get a drawable — this gives us a texture we can blit from.
+        // The layer must have framebufferOnly = NO for texture reads.
+        BOOL wasFramebufferOnly = metalLayer.framebufferOnly;
+        metalLayer.framebufferOnly = NO;
+
+        id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
+        if (!drawable) {
+            metalLayer.framebufferOnly = wasFramebufferOnly;
+            return;
+        }
+
+        id<MTLTexture> srcTexture = drawable.texture;
+        if (!srcTexture) {
+            metalLayer.framebufferOnly = wasFramebufferOnly;
+            return;
+        }
+
+        // Create a CPU-readable texture to copy into
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:srcTexture.pixelFormat
+                                                                                       width:w
+                                                                                      height:h
+                                                                                   mipmapped:NO];
+        desc.storageMode = MTLStorageModeShared;
+        desc.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> readTex = [device newTextureWithDescriptor:desc];
+        if (!readTex) {
+            metalLayer.framebufferOnly = wasFramebufferOnly;
+            return;
+        }
+
+        // Blit source → readable texture
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+        [blit copyFromTexture:srcTexture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:readTex
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        metalLayer.framebufferOnly = wasFramebufferOnly;
+
+        // Read pixels from the shared-storage texture
+        size_t bytesPerRow = w * 4;
+        size_t totalBytes = 8 + bytesPerRow * h;
+        uint8_t *buf = (uint8_t *)malloc(totalBytes);
+        if (!buf) return;
+
+        // Header
+        buf[0] = w & 0xFF; buf[1] = (w >> 8) & 0xFF; buf[2] = (w >> 16) & 0xFF; buf[3] = (w >> 24) & 0xFF;
+        buf[4] = h & 0xFF; buf[5] = (h >> 8) & 0xFF; buf[6] = (h >> 16) & 0xFF; buf[7] = (h >> 24) & 0xFF;
+
+        [readTex getBytes:(buf + 8)
+              bytesPerRow:bytesPerRow
+               fromRegion:MTLRegionMake2D(0, 0, w, h)
+              mipmapLevel:0];
+
+        result = buf;
+    });
+    return result;
+}
+
+// Free a buffer returned by wgpuViewCapturePixels
+extern "C" void wgpuViewFreePixels(void *buf) {
+    if (buf) free(buf);
+}
+
 extern "C" void webviewGoForward(AbstractView *abstractView) {
     if (!abstractView) {
         NSLog(@"webviewGoForward: abstractView is null");
         return;
     }
-    
+
     // Check if webview still exists in global tracking
     if (!globalAbstractViews[@(abstractView.webviewId)]) {
         NSLog(@"webviewGoForward: webview %u not in tracking, skipping", abstractView.webviewId);
@@ -7215,22 +7304,7 @@ extern "C" BOOL webviewCanGoForward(AbstractView *abstractView) {
 }
 
 extern "C" void evaluateJavaScriptWithNoCompletion(AbstractView *abstractView, const char *script) {                    
-    if (!abstractView) {
-        return;
-    }
-
-    NSNumber *webviewKey = @(abstractView.webviewId);
-    AbstractView *trackedView = globalAbstractViews[webviewKey];
-    if (!trackedView) {
-        NSLog(@"evaluateJavaScriptWithNoCompletion: webview %u not in tracking, skipping", abstractView.webviewId);
-        return;
-    }
-
-    if (trackedView != abstractView) {
-        NSLog(@"evaluateJavaScriptWithNoCompletion: WARNING - tracked view %p != passed view %p for webviewId %u", trackedView, abstractView, abstractView.webviewId);
-    }
-
-    [trackedView evaluateJavaScriptWithNoCompletion:script];
+    [abstractView evaluateJavaScriptWithNoCompletion:script];        
 }
 
 extern "C" void testFFI(void *ptr) {              

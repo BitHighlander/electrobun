@@ -386,6 +386,14 @@ export const native = (() => {
 				args: [FFIType.ptr],
 				returns: FFIType.ptr,
 			},
+			wgpuViewCapturePixels: {
+				args: [FFIType.ptr],
+				returns: FFIType.ptr,
+			},
+			wgpuViewFreePixels: {
+				args: [FFIType.ptr],
+				returns: FFIType.void,
+			},
 			wgpuInstanceCreateSurfaceMainThread: {
 				args: [FFIType.ptr, FFIType.ptr],
 				returns: FFIType.ptr,
@@ -1334,6 +1342,33 @@ window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.me
 
 			const handle = native.symbols.wgpuViewGetNativeHandle(view.ptr);
 			return handle || null;
+		},
+
+		wgpuViewCapturePixels: (params: { id: number }): { width: number; height: number; pixels: Uint8Array } | null => {
+			const view = WGPUView.getById(params.id);
+			if (!view?.ptr) return null;
+			const bufPtr = native.symbols.wgpuViewCapturePixels(view.ptr);
+			if (!bufPtr) return null;
+			// Read header: [u32 width][u32 height] then BGRA pixels
+			const header = new DataView(toArrayBuffer(bufPtr, 0, 8));
+			const width = header.getUint32(0, true);
+			const height = header.getUint32(4, true);
+			if (width === 0 || height === 0) {
+				native.symbols.wgpuViewFreePixels(bufPtr);
+				return null;
+			}
+			const pixelBytes = width * height * 4;
+			const nativeView = new Uint8Array(toArrayBuffer(bufPtr, 8, pixelBytes));
+			// Copy and BGRA→RGBA swizzle in one pass
+			const pixels = new Uint8Array(pixelBytes);
+			for (let i = 0; i < pixelBytes; i += 4) {
+				pixels[i]     = nativeView[i + 2]; // R ← B
+				pixels[i + 1] = nativeView[i + 1]; // G ← G
+				pixels[i + 2] = nativeView[i];     // B ← R
+				pixels[i + 3] = nativeView[i + 3]; // A ← A
+			}
+			native.symbols.wgpuViewFreePixels(bufPtr);
+			return { width, height, pixels };
 		},
 
 		evaluateJavascriptWithNoCompletion: (params: {
@@ -2881,7 +2916,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			webview.remove();
+			native.symbols.webviewRemove(webview.ptr);
 		},
 		startWindowMove: (params: { id: number }) => {
 			const windowPtr = getWindowPtr(params.id);

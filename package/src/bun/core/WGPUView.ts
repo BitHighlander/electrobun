@@ -127,6 +127,11 @@ export class WGPUView {
 		return ffi.request.wgpuViewGetNativeHandle({ id: this.id });
 	}
 
+	/** Capture RGBA pixels from the Metal layer. Returns {width, height, pixels} or null. */
+	capturePixels(): { width: number; height: number; pixels: Uint8Array } | null {
+		return ffi.request.wgpuViewCapturePixels({ id: this.id });
+	}
+
 	static getById(id: number) {
 		return WGPUViewMap[id];
 	}
