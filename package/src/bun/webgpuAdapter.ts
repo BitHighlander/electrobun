@@ -943,8 +943,14 @@ class GPUQueue {
 			ptr(buffer),
 		);
 		if (LAST_SURFACE_PTR && LAST_SURFACE_HAS_TEXTURE) {
-			LAST_SURFACE_HAS_TEXTURE = false;
-			WGPUBridge.surfacePresent(LAST_SURFACE_PTR as any);
+			// If a context has requested capture, skip auto-present so the
+			// caller can copyTextureToBuffer before presenting manually.
+			if (LAST_CREATED_CONTEXT?._deferPresent) {
+				// Leave LAST_SURFACE_HAS_TEXTURE true — finishCapture() will present
+			} else {
+				LAST_SURFACE_HAS_TEXTURE = false;
+				WGPUBridge.surfacePresent(LAST_SURFACE_PTR as any);
+			}
 		}
 	}
 	writeBuffer(buffer: GPUBuffer, offset: number, data: ArrayBufferView) {
@@ -1929,6 +1935,55 @@ class GPUCommandEncoder {
 			BigInt(size),
 		);
 	}
+	copyTextureToBuffer(
+		source: {
+			texture: GPUTexture;
+			mipLevel?: number;
+			origin?: { x?: number; y?: number; z?: number };
+		},
+		destination: {
+			buffer: GPUBuffer;
+			offset?: number;
+			bytesPerRow?: number;
+			rowsPerImage?: number;
+		},
+		size: { width: number; height: number; depthOrArrayLayers?: number },
+	) {
+		// WGPUTexelCopyTextureInfo: texture(ptr8) + mipLevel(u32) + origin(3xu32) + aspect(u32)
+		const srcBuf = new ArrayBuffer(32);
+		const srcView = new DataView(srcBuf);
+		srcView.setBigUint64(0, BigInt(source.texture.ptr), true);
+		srcView.setUint32(8, source.mipLevel ?? 0, true);
+		srcView.setUint32(12, source.origin?.x ?? 0, true);
+		srcView.setUint32(16, source.origin?.y ?? 0, true);
+		srcView.setUint32(20, source.origin?.z ?? 0, true);
+		srcView.setUint32(24, 1, true); // aspect = All
+		WGPU_KEEPALIVE.push(srcBuf);
+
+		// WGPUTexelCopyBufferInfo: layout(offset u64 + bytesPerRow u32 + rowsPerImage u32) + buffer(ptr8)
+		const dstBuf = new ArrayBuffer(24);
+		const dstView = new DataView(dstBuf);
+		dstView.setBigUint64(0, BigInt(destination.offset ?? 0), true);
+		dstView.setUint32(8, destination.bytesPerRow ?? 0, true);
+		dstView.setUint32(12, destination.rowsPerImage ?? 0, true);
+		dstView.setBigUint64(16, BigInt(destination.buffer.ptr), true);
+		WGPU_KEEPALIVE.push(dstBuf);
+
+		// WGPUExtent3D: 3x u32
+		const sizeBuf = new ArrayBuffer(12);
+		const sizeView = new DataView(sizeBuf);
+		sizeView.setUint32(0, size.width, true);
+		sizeView.setUint32(4, size.height, true);
+		sizeView.setUint32(8, size.depthOrArrayLayers ?? 1, true);
+		WGPU_KEEPALIVE.push(sizeBuf);
+
+		WGPUNative.symbols.wgpuCommandEncoderCopyTextureToBuffer(
+			this.ptr,
+			ptr(srcBuf) as any,
+			ptr(dstBuf) as any,
+			ptr(sizeBuf) as any,
+		);
+	}
 	finish() {
 		const cmdPtr = WGPUNative.symbols.wgpuCommandEncoderFinish(this.ptr, 0);
 		return new GPUCommandBuffer(cmdPtr);
@@ -2110,6 +2165,10 @@ class GPUCanvasContext {
 	height = 1;
 	private _hasCurrentTexture = false;
 	_fallbackSize?: { width: number; height: number };
+	/** When true, queue.submit() skips auto-present so the texture can be copied first */
+	_deferPresent = false;
+	/** The texture returned by the most recent getCurrentTexture() call */
+	_lastTexture: GPUTexture | null = null;
 	constructor(surfacePtr: number, instancePtr?: number) {
 		this.surfacePtr = surfacePtr;
 		this.instancePtr = instancePtr ?? null;
@@ -2180,10 +2239,14 @@ class GPUCanvasContext {
 		LAST_SURFACE_PTR = this.surfacePtr;
 		this._hasCurrentTexture = true;
 		LAST_SURFACE_HAS_TEXTURE = true;
-		return new GPUTexture(texPtr, this.format);
+		const tex = new GPUTexture(texPtr, this.format);
+		this._lastTexture = tex;
+		return tex;
 	}
 	present() {
 		if (!this._hasCurrentTexture) return;
+		// If capture mode is active, skip — finishCapture() will present
+		if (this._deferPresent) return;
 		this._hasCurrentTexture = false;
 		LAST_SURFACE_HAS_TEXTURE = false;
 		return WGPUBridge.surfacePresent(this.surfacePtr as any);
@@ -2192,6 +2255,28 @@ class GPUCanvasContext {
 		this._hasCurrentTexture = false;
 		LAST_SURFACE_HAS_TEXTURE = false;
 		return WGPUNative.symbols.wgpuSurfaceUnconfigure(this.surfacePtr as any);
+	}
+
+	/**
+	 * Tell the context to defer auto-present on the next queue.submit().
+	 * Call this BEFORE renderer.render() to keep the surface texture available
+	 * for copyTextureToBuffer readback.
+	 */
+	requestCapture() {
+		this._deferPresent = true;
+	}
+
+	/**
+	 * Present the deferred frame after readback is complete.
+	 * Must be called after requestCapture() + readback to avoid stalling the surface.
+	 */
+	finishCapture() {
+		this._deferPresent = false;
+		if (this._hasCurrentTexture) {
+			this._hasCurrentTexture = false;
+			LAST_SURFACE_HAS_TEXTURE = false;
+			WGPUBridge.surfacePresent(this.surfacePtr as any);
+		}
 	}
 }
 
@@ -2239,12 +2324,13 @@ function createContext(view: WGPUView | GpuWindow) {
 		pick.alphaModes.length ? pick.alphaModes : [pick.alphaMode],
 	);
 	try {
-		if (view instanceof GpuWindow) {
-			const size = view.getSize();
-			ctx.width = size.width;
-			ctx.height = size.height;
-			ctx._fallbackSize = { width: size.width, height: size.height };
-		}
+		const size =
+			view instanceof GpuWindow
+				? view.getSize()
+				: { width: view.frame.width, height: view.frame.height };
+		ctx.width = size.width;
+		ctx.height = size.height;
+		ctx._fallbackSize = { width: size.width, height: size.height };
 	} catch {}
 
 	const created = {
