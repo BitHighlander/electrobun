@@ -911,6 +911,7 @@ static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews = ni
     int _bufferWidth;
     int _bufferHeight;
     BOOL _hasNewFrame;
+    uint64_t _displayGeneration;  // incremented on resize/teardown to invalidate queued frames
 }
 @property (nonatomic, assign) void* cefBrowser;  // CefRefPtr<CefBrowser> stored as void*
 @property (nonatomic, strong) NSTrackingArea *trackingArea;
@@ -1624,6 +1625,24 @@ static void schedulePendingResizeDrain() {
         [super keyUp:event];
     }
 
+    - (void)magnifyWithEvent:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr magnifyWithEvent:event]; return; }
+        [super magnifyWithEvent:event];
+    }
+
+    - (void)swipeWithEvent:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr swipeWithEvent:event]; return; }
+        [super swipeWithEvent:event];
+    }
+
+    - (void)rotateWithEvent:(NSEvent *)event {
+        CEFOSRView *osr = [self overlayOSRView];
+        if (osr) { [osr rotateWithEvent:event]; return; }
+        [super rotateWithEvent:event];
+    }
+
     - (BOOL)acceptsFirstResponder { return YES; }
 
     - (void)mouseMoved:(NSEvent *)event {
@@ -1740,6 +1759,7 @@ static void schedulePendingResizeDrain() {
 }
 
 - (void)dealloc {
+    _displayGeneration++;  // cancel any in-flight dispatch_async frames
     [_bufferLock lock];
     if (_pixelBuffer) {
         free(_pixelBuffer);
@@ -1845,8 +1865,12 @@ static void schedulePendingResizeDrain() {
     [_bufferLock unlock];
     NSLog(@"DEBUG OSR updateBuffer: Lock released, requesting redraw");
 
-    // Update display target — either CALayer (overlay mode) or NSView drawRect
+    // Update display target — either CALayer (overlay mode) or NSView drawRect.
+    // Capture the current generation so stale frames queued before a resize or
+    // teardown are silently dropped instead of painting over the new state.
+    uint64_t gen = _displayGeneration;
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (gen != self->_displayGeneration) return;  // stale frame — skip
         if (self.displayLayer) {
             // Render into the standalone CALayer (composites above CAMetalLayer)
             [self updateDisplayLayer];
@@ -2154,6 +2178,7 @@ static void schedulePendingResizeDrain() {
 
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
+    _displayGeneration++;  // invalidate queued frames from old size
 
     // Notify CEF of size change
     if (self.cefBrowser) {
@@ -7122,6 +7147,10 @@ extern "C" void* wgpuViewGetNativeHandle(AbstractView *abstractView) {
 }
 
 // Capture BGRA pixels from the WGPUView's CAMetalLayer using Metal texture readback.
+// NOTE: This captures the GPU layer ONLY — the CEF browser overlay (if composited
+// above via displayLayer/CALayer z-ordering) is NOT included. Use the WebGPU
+// copyTextureToBuffer readback path for the same GPU-only capture from TypeScript,
+// or macOS screencapture for the full composited window (GPU + browser UI).
 // Grabs a new drawable, blits the layer's framebuffer into a CPU-readable texture, and
 // returns: [4 bytes width LE][4 bytes height LE][width*height*4 BGRA bytes]
 // The caller converts BGRA→RGBA if needed. Caller must free the returned pointer.
