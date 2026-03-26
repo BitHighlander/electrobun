@@ -19,7 +19,7 @@ import { execSync } from "child_process";
 import * as readline from "readline";
 import { OS, ARCH } from "../shared/platform";
 import { DEFAULT_CEF_VERSION_STRING } from "../shared/cef-version";
-import { BUN_VERSION } from "../shared/bun-version";
+import { BUN_VERSION, BUN_VERSION_MACOS_X64 } from "../shared/bun-version";
 import { ELECTROBUN_VERSION } from "../shared/electrobun-version";
 import {
 	getAppFileName,
@@ -3237,7 +3237,8 @@ Categories=Utility;Application;
 			...(bundlesCEF
 				? { cefVersion: config.build?.cefVersion ?? DEFAULT_CEF_VERSION_STRING }
 				: {}),
-			bunVersion: config.build?.bunVersion ?? BUN_VERSION,
+			bunVersion: config.build?.bunVersion
+			?? (OS === "macos" && ARCH === "x64" ? BUN_VERSION_MACOS_X64 : BUN_VERSION),
 			...(config.build?.bunnyBun ? { bunnyBun: config.build.bunnyBun } : {}),
 		};
 

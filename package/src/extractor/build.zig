@@ -15,6 +15,12 @@ pub fn build(b: *std.Build) void {
     // Link with libc for chmod and other system calls
     exe.linkLibC();
 
+    // Reserve space for Apple codesign's LC_CODE_SIGNATURE load command.
+    // Without this, codesign overwrites __TEXT:__text on x86_64 (ziglang/zig#23704).
+    if (target.result.os.tag == .macos) {
+        exe.headerpad_size = 0x1000;
+    }
+
     // Use Console subsystem on all platforms so users can see extraction progress
     // The console window will automatically close when extraction completes
 
