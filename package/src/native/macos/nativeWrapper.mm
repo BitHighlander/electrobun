@@ -6371,6 +6371,63 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
     }
 @end
 
+// Workaround for WebKit WKWindowVisibilityObserver use-after-free bug
+// (WebKit bugs #272559, #272605). On older WebKit builds (pre-April 2024),
+// the internal WKWindowVisibilityObserver crashes when NSWindowDidResignKeyNotification
+// is posted. We swizzle NSWindow.resignKeyWindow to remove the dangling observers
+// before calling the original implementation.
+#include <objc/runtime.h>
+
+// Workaround for WebKit WKWindowVisibilityObserver use-after-free (WebKit #272559/#272605).
+// On older WebKit builds, the internal WKWindowVisibilityObserver has a dangling observer
+// registration that crashes when window resign/deactivate notifications fire.
+// Fix: replace resignKeyWindow and resignMainWindow with safe versions that skip the
+// notification posting (which triggers the dangling observer) and only call our delegate.
+// The window state management is handled by the caller (_NXEndKeyAndMain).
+#include <objc/runtime.h>
+
+static void safe_resignKeyWindow(id self, SEL _cmd) {
+    // Skip the original implementation which posts NSWindowDidResignKeyNotification
+    // (triggers WebKit's dangling WKWindowVisibilityObserver crash).
+    // Instead, manually notify our delegate only.
+    NSWindow *window = (NSWindow *)self;
+    id delegate = [window delegate];
+    if (delegate && [delegate respondsToSelector:@selector(windowDidResignKey:)]) {
+        NSNotification *note = [NSNotification notificationWithName:NSWindowDidResignKeyNotification
+                                                             object:window];
+        [delegate windowDidResignKey:note];
+    }
+}
+
+static void safe_resignMainWindow(id self, SEL _cmd) {
+    // Same approach for resignMainWindow
+    NSWindow *window = (NSWindow *)self;
+    id delegate = [window delegate];
+    if (delegate && [delegate respondsToSelector:@selector(windowDidResignMain:)]) {
+        NSNotification *note = [NSNotification notificationWithName:NSWindowDidResignMainNotification
+                                                             object:window];
+        [delegate windowDidResignMain:note];
+    }
+}
+
+__attribute__((constructor))
+static void installResignKeyWindowFix(void) {
+    // Only apply on macOS 13+ where the WebKit WKWindowVisibilityObserver
+    // use-after-free bug exists (WebKit #272559/#272605). On macOS 12 the
+    // swizzle causes SIGILL crashes because AppKit's internal resign path
+    // and delegate state differ from macOS 13+.
+    if (@available(macOS 13.0, *)) {
+        Method keyMethod = class_getInstanceMethod([NSWindow class], @selector(resignKeyWindow));
+        if (keyMethod) {
+            method_setImplementation(keyMethod, (IMP)safe_resignKeyWindow);
+        }
+        Method mainMethod = class_getInstanceMethod([NSWindow class], @selector(resignMainWindow));
+        if (mainMethod) {
+            method_setImplementation(mainMethod, (IMP)safe_resignMainWindow);
+        }
+    }
+}
+
 /*
  * =============================================================================
  * 6. EXTERN "C" BRIDGING FUNCTIONS
@@ -6599,18 +6656,18 @@ extern "C" AbstractView* initWebview(uint32_t webviewId,
 
         impl = [[ImplClass alloc] initWithWebviewId:webviewId
                                         window:window
-                                        url:strdup(url)
+                                        url:url ? strdup(url) : strdup("")
                                         frame:frame
                                         autoResize:autoResize
-                                        partitionIdentifier:strdup(partitionIdentifier)
+                                        partitionIdentifier:partitionIdentifier ? strdup(partitionIdentifier) : strdup("")
                                         navigationCallback:navigationCallback
                                         webviewEventHandler:webviewEventHandler
                                         eventBridgeHandler:eventBridgeHandler
                                         bunBridgeHandler:bunBridgeHandler
                                         internalBridgeHandler:internalBridgeHandler
-                                        electrobunPreloadScript:strdup(electrobunPreloadScript)
-                                        customPreloadScript:strdup(customPreloadScript)
-                                        viewsRoot:strdup(viewsRoot)
+                                        electrobunPreloadScript:electrobunPreloadScript ? strdup(electrobunPreloadScript) : strdup("")
+                                        customPreloadScript:customPreloadScript ? strdup(customPreloadScript) : strdup("")
+                                        viewsRoot:viewsRoot ? strdup(viewsRoot) : strdup("")
                                         transparent:transparent
                                         sandbox:sandbox];
 
