@@ -7332,8 +7332,11 @@ extern "C" BOOL webviewCanGoForward(AbstractView *abstractView) {
     return [abstractView canGoForward];
 }
 
-extern "C" void evaluateJavaScriptWithNoCompletion(AbstractView *abstractView, const char *script) {                    
-    [abstractView evaluateJavaScriptWithNoCompletion:script];        
+extern "C" void evaluateJavaScriptWithNoCompletion(AbstractView *abstractView, const char *script) {
+    if (!abstractView) {
+        return;
+    }
+    [abstractView evaluateJavaScriptWithNoCompletion:script];
 }
 
 extern "C" void testFFI(void *ptr) {              
