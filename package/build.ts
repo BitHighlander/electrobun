@@ -2073,13 +2073,14 @@ async function buildSelfExtractor() {
 }
 
 async function buildCli() {
-	// await $`bun build src/cli/index.ts --compile --outfile src/cli/build/electrobun`;
-
-	const compileTarget =
-		process.platform === "win32" ? "--target=bun-windows-x64-baseline" : "";
-
-	// Use vendored Bun for building CLI to ensure consistency with CI and proper code signing
-	await $`BUN_INSTALL_CACHE_DIR=/tmp/bun-cache ${PATH.bun.RUNTIME} build src/cli/index.ts --compile ${compileTarget} --outfile src/cli/build/electrobun`;
+	// Use vendored Bun for building CLI to ensure consistency with CI and proper code signing.
+	// NOTE: on non-Windows, don't pass --target at all — an empty string arg in Bun's $
+	// shell template resolves to "" as the entrypoint ("ModuleNotFound resolving ''").
+	if (process.platform === "win32") {
+		await $`BUN_INSTALL_CACHE_DIR=/tmp/bun-cache ${PATH.bun.RUNTIME} build src/cli/index.ts --compile --target=bun-windows-x64-baseline --outfile src/cli/build/electrobun`;
+	} else {
+		await $`BUN_INSTALL_CACHE_DIR=/tmp/bun-cache ${PATH.bun.RUNTIME} build src/cli/index.ts --compile --outfile src/cli/build/electrobun`;
+	}
 }
 
 async function buildPreload() {
