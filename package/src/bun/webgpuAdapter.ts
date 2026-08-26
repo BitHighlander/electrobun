@@ -3,7 +3,7 @@ import { WGPUView } from "./core/WGPUView";
 import { GpuWindow } from "./core/GpuWindow";
 import WGPU from "./webGPU";
 import { WGPUBridge } from "./proc/native";
-import { ptr, CString, toArrayBuffer, type Pointer, JSCallback } from "bun:ffi";
+import { ptr, toArrayBuffer, type Pointer, JSCallback } from "bun:ffi";
 import { inflateSync } from "zlib";
 
 const WGPUNative = WGPU.native;
@@ -21,6 +21,8 @@ const WGPUTextureFormat_RGBA32Uint = 0x0000002A;
 const WGPUTextureFormat_RGBA16Sint = 0x00000027;
 const WGPUTextureFormat_RGBA16Uint = 0x00000026;
 const WGPUTextureFormat_RGBA16Float = 0x00000028;
+const WGPUTextureFormat_RGBA32Float = 0x00000029;
+const WGPUTextureFormat_RG16Float = 0x00000015;
 const WGPUTextureFormat_RG32Sint = 0x00000023;
 const WGPUTextureFormat_RG32Uint = 0x00000022;
 const WGPUTextureFormat_RG32Float = 0x00000021;
@@ -38,6 +40,7 @@ const WGPUTextureFormat_R8Unorm = 0x00000001;
 const WGPUTextureFormat_R8Snorm = 0x00000002;
 const WGPUTextureFormat_R8Uint = 0x00000003;
 const WGPUTextureFormat_R8Sint = 0x00000004;
+const WGPUTextureFormat_R16Float = 0x00000009;
 // Block-compression (BC1-7) formats. Desktop-relevant (Metal/Dawn on macOS).
 // Values from webgpu.h (WGPUTextureFormat enum).
 const WGPUTextureFormat_BC1RGBAUnorm = 0x00000032;
@@ -265,9 +268,13 @@ function makeStringView(str?: string | null) {
 	if (!str) {
 		return { ptr: 0, len: 0n, cstr: null };
 	}
-	const cstr = new CString(str);
-	WGPU_KEEPALIVE.push(cstr);
-	return { ptr: cstr.ptr, len: WGPU_STRLEN, cstr };
+	// Keep an explicitly-sized UTF-8 buffer alive. Passing CString.ptr with the
+	// SIZE_MAX sentinel was observed as an undefined entry point by Dawn for
+	// shader modules containing multiple functions, even though simple modules
+	// happened to auto-select successfully.
+	const encoded = new TextEncoder().encode(`${str}\0`);
+	WGPU_KEEPALIVE.push(encoded);
+	return { ptr: ptr(encoded), len: BigInt(encoded.byteLength - 1), cstr: encoded };
 }
 
 function makeSurfaceConfiguration(
@@ -1146,35 +1153,9 @@ class GPUQueue {
 				: Math.max(1, dataLayout.rowsPerImage ?? 1);
 		const layers = size.depthOrArrayLayers ?? 1;
 		if (width <= 0 || height <= 0 || layers <= 0) return;
-		const inferredBpp = Math.floor(
-			data.byteLength / Math.max(1, width * height * layers),
-		);
-		if (inferredBpp > bytesPerPixel) {
-			bytesPerPixel = inferredBpp;
-		}
-		const exactRGBABytes = width * height * layers * 4;
-		if (data.byteLength === exactRGBABytes) {
-			bytesPerPixel = 4;
-		}
 		let minBytesPerRow = Math.max(1, width * bytesPerPixel);
-		const minExpectedSize = minBytesPerRow * height * layers;
-		if (data.byteLength > minExpectedSize && height > 0) {
-			const widthFromData = Math.floor(
-				data.byteLength / Math.max(1, height * layers * bytesPerPixel),
-			);
-			if (widthFromData > width) {
-				width = widthFromData;
-				minBytesPerRow = Math.max(1, width * bytesPerPixel);
-			}
-		}
 		let bytesPerRow = dataLayout.bytesPerRow ?? minBytesPerRow;
 		if (bytesPerRow < minBytesPerRow) bytesPerRow = minBytesPerRow;
-		const derivedRowBytes = Math.ceil(
-			data.byteLength / Math.max(1, height * layers),
-		);
-		if (bytesPerRow < derivedRowBytes) {
-			bytesPerRow = derivedRowBytes;
-		}
 		let rowsPerImage = dataLayout.rowsPerImage ?? height;
 		if (rowsPerImage === 0) rowsPerImage = height;
 
@@ -1555,11 +1536,13 @@ class GPUDevice {
 			this.ptr,
 			desc.ptr as any,
 		);
-		return new GPUShaderModule(modulePtr);
+		return new GPUShaderModule(modulePtr, descriptor.code);
 	}
 	createRenderPipeline(descriptor: any) {
 		const vertexModule = descriptor.vertex.module as GPUShaderModule;
-		const vertexEntry = makeStringView(descriptor.vertex.entryPoint ?? "main");
+		const vertexEntry = makeStringView(
+			descriptor.vertex.entryPoint || vertexModule.entryPoint("vertex") || "main",
+		);
 		const vertexBuffers = descriptor.vertex.buffers ?? [];
 		const vertexLayouts: ArrayBuffer[] = [];
 		const vertexLayoutPtrs: number[] = [];
@@ -1610,7 +1593,9 @@ class GPUDevice {
 		let fragmentStatePtr: number | null = null;
 		if (descriptor.fragment) {
 			const fragModule = descriptor.fragment.module as GPUShaderModule;
-			const fragEntry = makeStringView(descriptor.fragment.entryPoint ?? "main");
+			const fragEntry = makeStringView(
+				descriptor.fragment.entryPoint || fragModule.entryPoint("fragment") || "main",
+			);
 			const targets = descriptor.fragment.targets ?? [];
 			const targetBuf = new ArrayBuffer(targets.length * 32);
 			targets.forEach((t: any, i: number) => {
@@ -1720,7 +1705,9 @@ class GPUDevice {
 		compute: { module: GPUShaderModule; entryPoint?: string };
 	}) {
 		const module = descriptor.compute.module as GPUShaderModule;
-		const entry = makeStringView(descriptor.compute.entryPoint ?? "main");
+		const entry = makeStringView(
+			descriptor.compute.entryPoint || descriptor.compute.module.entryPoint("compute") || "main",
+		);
 		const stage = makeProgrammableStageDescriptor(
 			module.ptr,
 			{ ptr: entry.ptr as any, len: entry.len },
@@ -1955,8 +1942,13 @@ class GPUPipelineLayout {
 
 class GPUShaderModule {
 	ptr: number;
-	constructor(ptr: number) {
+	private readonly code: string;
+	constructor(ptr: number, code = "") {
 		this.ptr = ptr;
+		this.code = code;
+	}
+	entryPoint(stage: "vertex" | "fragment" | "compute") {
+		return this.code.match(new RegExp(`@${stage}\\s+fn\\s+([A-Za-z_][A-Za-z0-9_]*)`))?.[1];
 	}
 }
 
@@ -2100,20 +2092,76 @@ class GPUCommandEncoder {
 		},
 		size: { width: number; height: number; depthOrArrayLayers?: number },
 	) {
-		const offset = source.offset ?? 0;
-		const mapped = source.buffer.getMappedRange(0, source.buffer.size);
-		const data =
-			offset > 0
-				? new Uint8Array(mapped, offset)
-				: new Uint8Array(mapped);
-		this._device.queue.writeTexture(
-			destination,
-			data,
-			{
-				bytesPerRow: source.bytesPerRow ?? 0,
-				rowsPerImage: source.rowsPerImage ?? 0,
-			},
-			size,
+		const srcBuf = new ArrayBuffer(24);
+		const srcView = new DataView(srcBuf);
+		srcView.setBigUint64(0, BigInt(source.offset ?? 0), true);
+		srcView.setUint32(8, source.bytesPerRow ?? 0, true);
+		srcView.setUint32(12, source.rowsPerImage ?? 0, true);
+		srcView.setBigUint64(16, BigInt(source.buffer.ptr), true);
+		WGPU_KEEPALIVE.push(srcBuf);
+
+		const dstBuf = new ArrayBuffer(32);
+		const dstView = new DataView(dstBuf);
+		dstView.setBigUint64(0, BigInt(destination.texture.ptr), true);
+		dstView.setUint32(8, destination.mipLevel ?? 0, true);
+		dstView.setUint32(12, destination.origin?.x ?? 0, true);
+		dstView.setUint32(16, destination.origin?.y ?? 0, true);
+		dstView.setUint32(20, destination.origin?.z ?? 0, true);
+		dstView.setUint32(24, WGPUTextureAspect_All, true);
+		WGPU_KEEPALIVE.push(dstBuf);
+
+		const sizeBuf = new ArrayBuffer(12);
+		const sizeView = new DataView(sizeBuf);
+		sizeView.setUint32(0, size.width, true);
+		sizeView.setUint32(4, size.height, true);
+		sizeView.setUint32(8, size.depthOrArrayLayers ?? 1, true);
+		WGPU_KEEPALIVE.push(sizeBuf);
+
+		WGPUNative.symbols.wgpuCommandEncoderCopyBufferToTexture(
+			this.ptr,
+			ptr(srcBuf) as any,
+			ptr(dstBuf) as any,
+			ptr(sizeBuf) as any,
+		);
+	}
+	copyTextureToTexture(
+		source: { texture: GPUTexture; mipLevel?: number; origin?: { x?: number; y?: number; z?: number } },
+		destination: { texture: GPUTexture; mipLevel?: number; origin?: { x?: number; y?: number; z?: number } },
+		size: { width: number; height: number; depthOrArrayLayers?: number },
+	) {
+		const textureInfo = (copy: typeof source) => {
+			const buffer = new ArrayBuffer(32);
+			const view = new DataView(buffer);
+			view.setBigUint64(0, BigInt(copy.texture.ptr), true);
+			view.setUint32(8, copy.mipLevel ?? 0, true);
+			view.setUint32(12, copy.origin?.x ?? 0, true);
+			view.setUint32(16, copy.origin?.y ?? 0, true);
+			view.setUint32(20, copy.origin?.z ?? 0, true);
+			view.setUint32(24, WGPUTextureAspect_All, true);
+			WGPU_KEEPALIVE.push(buffer);
+			return buffer;
+		};
+		const srcBuf = textureInfo(source);
+		const dstBuf = textureInfo(destination);
+		const sizeBuf = new ArrayBuffer(12);
+		const sizeView = new DataView(sizeBuf);
+		sizeView.setUint32(0, size.width, true);
+		sizeView.setUint32(4, size.height, true);
+		sizeView.setUint32(8, size.depthOrArrayLayers ?? 1, true);
+		WGPU_KEEPALIVE.push(sizeBuf);
+		WGPUNative.symbols.wgpuCommandEncoderCopyTextureToTexture(
+			this.ptr,
+			ptr(srcBuf) as any,
+			ptr(dstBuf) as any,
+			ptr(sizeBuf) as any,
+		);
+	}
+	clearBuffer(buffer: GPUBuffer, offset = 0, size?: number) {
+		WGPUNative.symbols.wgpuCommandEncoderClearBuffer(
+			this.ptr,
+			buffer.ptr,
+			BigInt(offset),
+			BigInt(size ?? Math.max(0, buffer.size - offset)),
 		);
 	}
 	copyBufferToBuffer(
@@ -2715,6 +2763,8 @@ function mapTextureFormat(format?: string | number | null) {
 			return WGPUTextureFormat_R8Uint;
 		case "r8sint":
 			return WGPUTextureFormat_R8Sint;
+		case "r16float":
+			return WGPUTextureFormat_R16Float;
 		case "rg8unorm":
 			return WGPUTextureFormat_RG8Unorm;
 		case "rg8snorm":
@@ -2751,6 +2801,10 @@ function mapTextureFormat(format?: string | number | null) {
 			return WGPUTextureFormat_RG32Sint;
 		case "rgba16float":
 			return WGPUTextureFormat_RGBA16Float;
+		case "rgba32float":
+			return WGPUTextureFormat_RGBA32Float;
+		case "rg16float":
+			return WGPUTextureFormat_RG16Float;
 		case "rgba16uint":
 			return WGPUTextureFormat_RGBA16Uint;
 		case "rgba16sint":
