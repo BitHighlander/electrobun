@@ -1362,10 +1362,10 @@ window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.me
 			// Copy and BGRA→RGBA swizzle in one pass
 			const pixels = new Uint8Array(pixelBytes);
 			for (let i = 0; i < pixelBytes; i += 4) {
-				pixels[i]     = nativeView[i + 2]; // R ← B
-				pixels[i + 1] = nativeView[i + 1]; // G ← G
-				pixels[i + 2] = nativeView[i];     // B ← R
-				pixels[i + 3] = nativeView[i + 3]; // A ← A
+				pixels[i]     = nativeView[i + 2]!; // R ← B
+				pixels[i + 1] = nativeView[i + 1]!; // G ← G
+				pixels[i + 2] = nativeView[i]!;     // B ← R
+				pixels[i + 3] = nativeView[i + 3]!; // A ← A
 			}
 			native.symbols.wgpuViewFreePixels(bufPtr);
 			return { width, height, pixels };
