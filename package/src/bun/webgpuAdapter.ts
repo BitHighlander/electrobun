@@ -195,6 +195,18 @@ let LAST_CREATED_CONTEXT: GPUCanvasContext | null = null;
 const VIEW_CONTEXTS = new Map<number, { instance: number; surface: number; context: GPUCanvasContext }>();
 const MAP_ASYNC_RESOLVERS = new Map<number, (mapped: boolean) => void>();
 const WORK_DONE_RESOLVERS = new Map<number, (ok: boolean) => void>();
+let NEXT_WORK_DONE_REQUEST_ID = 1;
+
+function nextWorkDoneRequestId(): number {
+	while (WORK_DONE_RESOLVERS.has(NEXT_WORK_DONE_REQUEST_ID)) {
+		NEXT_WORK_DONE_REQUEST_ID = NEXT_WORK_DONE_REQUEST_ID >= Number.MAX_SAFE_INTEGER
+			? 1
+			: NEXT_WORK_DONE_REQUEST_ID + 1;
+	}
+	const requestId = NEXT_WORK_DONE_REQUEST_ID;
+	NEXT_WORK_DONE_REQUEST_ID = requestId >= Number.MAX_SAFE_INTEGER ? 1 : requestId + 1;
+	return requestId;
+}
 
 const bufferMapCallback = new JSCallback(
 	(status: number, _message: number, userdata1: number, _userdata2: number) => {
@@ -1205,39 +1217,63 @@ class GPUQueue {
 		);
 	}
 	onSubmittedWorkDone() {
-		const callbackPtr = (queueWorkDoneCallback as any).ptr ?? queueWorkDoneCallback;
-		const info = makeQueueWorkDoneCallbackInfo(
-			Number(callbackPtr),
-			this.ptr,
-			0,
-		);
-		WGPU_KEEPALIVE.push(info.buffer);
-		WGPUBridge.queueOnSubmittedWorkDone(
-			this.ptr as any,
-			info.ptr as any,
-		);
 		return new Promise<boolean>((resolve) => {
 			let done = false;
-			const resolveOnce = () => {
+			const requestId = nextWorkDoneRequestId();
+			const resolveOnce = (ok: boolean) => {
 				if (done) return;
 				done = true;
-				resolve(true);
+				if (WORK_DONE_RESOLVERS.get(requestId) === resolveOnce) {
+					WORK_DONE_RESOLVERS.delete(requestId);
+				}
+				resolve(ok);
 			};
-			WORK_DONE_RESOLVERS.set(this.ptr, () => resolveOnce());
+			// AllowSpontaneous permits Dawn to invoke the callback during native
+			// registration. Install the resolver first or an already-idle queue loses
+			// its completion and waits for the five-second fallback every time. Each
+			// request owns a distinct userdata key so concurrent calls cannot replace
+			// one another's resolver.
+			WORK_DONE_RESOLVERS.set(requestId, resolveOnce);
+			const callbackPtr = (queueWorkDoneCallback as any).ptr ?? queueWorkDoneCallback;
+			const info = makeQueueWorkDoneCallbackInfo(
+				Number(callbackPtr),
+				requestId,
+				0,
+			);
+			WGPU_KEEPALIVE.push(info.buffer);
+			const futureId = WGPUBridge.queueOnSubmittedWorkDone(
+				this.ptr as any,
+				info.ptr as any,
+			);
+			if (futureId === 0n) {
+				resolveOnce(false);
+				return;
+			}
 
 			const start = Date.now();
 			const poll = () => {
 				if (done) return;
 				try {
-					if ((this as any)._device?.instancePtr) {
+					const instancePtr = (this as any)._device?.instancePtr;
+					if (
+						instancePtr &&
+						futureId !== 0n &&
+						WGPUBridge.instanceWaitAny(instancePtr, futureId, 0n) === 1
+					) {
+						// Bun's threadsafe JSCallback may be queued after Dawn reports the
+						// future complete. Resolve from the future as well as the callback.
+						resolveOnce(true);
+						return;
+					}
+					if (instancePtr) {
 						WGPUNative.symbols.wgpuInstanceProcessEvents(
-							(this as any)._device.instancePtr,
+							instancePtr,
 						);
 					}
 					WGPUNative.symbols.wgpuDeviceTick((this as any)._device?.ptr ?? 0);
 				} catch {}
 				if (Date.now() - start > 5000) {
-					resolve(false);
+					resolveOnce(false);
 					return;
 				}
 				setTimeout(poll, 5);
