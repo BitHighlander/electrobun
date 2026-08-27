@@ -3207,6 +3207,94 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
 @property (nonatomic, assign) BOOL mousePassthrough;
 @end
 
+// Dawn's WebGPU/Metal backend drives the CAMetalLayer directly (via
+// wgpuInstanceCreateSurfaceMainThread / wgpuSurfaceConfigureMainThread /
+// wgpuSurfacePresentMainThread called from JS/FFI) — nativeWrapper.mm has no
+// hook into Dawn's per-frame render loop, so it has no other way to know
+// which MTLTexture was actually rendered to and presented. To support
+// screenshot capture (wgpuViewCapturePixels) we swizzle -[CAMetalLayer
+// nextDrawable] so that every time Dawn (or anything else) vends a drawable
+// from a given layer, we stash that drawable's texture as an associated
+// object on the layer. Because Dawn's per-frame flow is
+// nextDrawable -> render -> present -> (repeat), the most recently vended
+// texture is exactly the one that was last rendered into and presented by
+// the time a capture is requested.
+static void *kLastVendedDrawableTextureKey = &kLastVendedDrawableTextureKey;
+
+@interface CAMetalLayer (ElectrobunCaptureSwizzle)
+- (id<CAMetalDrawable>)eb_swizzled_nextDrawable;
+@end
+
+@implementation CAMetalLayer (ElectrobunCaptureSwizzle)
+- (id<CAMetalDrawable>)eb_swizzled_nextDrawable {
+    id<CAMetalDrawable> drawable = [self eb_swizzled_nextDrawable];
+    if (drawable && drawable.texture) {
+        objc_setAssociatedObject(self, kLastVendedDrawableTextureKey, drawable.texture, OBJC_ASSOCIATION_RETAIN);
+    }
+    return drawable;
+}
+@end
+
+static void ensureMetalLayerCaptureSwizzleInstalled(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class cls = [CAMetalLayer class];
+        SEL originalSel = @selector(nextDrawable);
+        SEL swizzledSel = @selector(eb_swizzled_nextDrawable);
+        Method originalMethod = class_getInstanceMethod(cls, originalSel);
+        Method swizzledMethod = class_getInstanceMethod(cls, swizzledSel);
+        if (originalMethod && swizzledMethod) {
+            method_exchangeImplementations(originalMethod, swizzledMethod);
+        }
+    });
+}
+
+// Dawn's Metal backend presents a frame by encoding
+// -[MTLCommandBuffer presentDrawable:] into the SAME command buffer that
+// contains its render commands, then committing. Capture must not blit from
+// the presented texture until that command buffer's GPU work has actually
+// completed — otherwise the readback can race ahead of the render (Metal
+// command buffers on independent queues aren't implicitly ordered), which in
+// practice silently grabs the post-clear/pre-draw contents of the texture.
+// We track the most recent presenting command buffer per-CAMetalLayer (via
+// the drawable's `.layer`) the same way, by swizzling presentDrawable: on
+// the concrete MTLCommandBuffer class, so capture can wait on it first.
+static void *kLastPresentCommandBufferKey = &kLastPresentCommandBufferKey;
+
+@interface NSObject (ElectrobunPresentDrawableSwizzle)
+- (void)eb_swizzled_presentDrawable:(id<MTLDrawable>)drawable;
+@end
+
+@implementation NSObject (ElectrobunPresentDrawableSwizzle)
+- (void)eb_swizzled_presentDrawable:(id<MTLDrawable>)drawable {
+    // Implementations were exchanged, so this call invokes the original.
+    [self eb_swizzled_presentDrawable:drawable];
+    if (drawable && [(id)drawable respondsToSelector:@selector(layer)]) {
+        CAMetalLayer *layer = ((id<CAMetalDrawable>)drawable).layer;
+        if (layer) {
+            objc_setAssociatedObject(layer, kLastPresentCommandBufferKey, self, OBJC_ASSOCIATION_RETAIN);
+        }
+    }
+}
+@end
+
+static void ensureCommandBufferPresentSwizzleInstalled(id<MTLDevice> device) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        if (!device) return;
+        id<MTLCommandQueue> tempQueue = [device newCommandQueue];
+        id<MTLCommandBuffer> tempCmdBuf = [tempQueue commandBuffer];
+        Class cls = [tempCmdBuf class];
+        SEL originalSel = @selector(presentDrawable:);
+        SEL swizzledSel = @selector(eb_swizzled_presentDrawable:);
+        Method originalMethod = class_getInstanceMethod(cls, originalSel);
+        Method swizzledMethod = class_getInstanceMethod([NSObject class], swizzledSel);
+        if (originalMethod && swizzledMethod) {
+            method_exchangeImplementations(originalMethod, swizzledMethod);
+        }
+    });
+}
+
 @implementation WGPUInputView
 
 // When mousePassthrough is enabled, this view is invisible to hit testing.
@@ -3299,6 +3387,8 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                 view.wantsLayer = YES;
                 view.layer.backgroundColor = [[NSColor clearColor] CGColor];
 
+                ensureMetalLayerCaptureSwizzleInstalled();
+                ensureCommandBufferPresentSwizzleInstalled(device);
                 CAMetalLayer *metalLayer = [CAMetalLayer layer];
                 metalLayer.device = device;
                 metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -3945,7 +4035,7 @@ static bool ensureWgpuTestSymbols() {
     return true;
 }
 
-extern "C" void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice) {
+extern "C" void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice, uint32_t* requiredFeatures, uint32_t requiredFeatureCount) {
     if (!ensureWgpuTestSymbols()) return;
     runOnMainThreadSyncVoid(^{
         WGPUInstance instance = (WGPUInstance)instancePtr;
@@ -3988,7 +4078,6 @@ extern "C" void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfa
         WGPURequestDeviceCallbackInfo deviceInfo = {};
         deviceInfo.mode = WGPUCallbackMode_AllowSpontaneous;
         deviceInfo.callback = [](WGPURequestDeviceStatus status, WGPUDevice cbDevice, WGPUStringView message, void* userdata1, void* userdata2) {
-            (void)message;
             (void)userdata2;
             struct {
                 WGPUDevice* device;
@@ -3996,6 +4085,8 @@ extern "C" void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfa
             }* ctx = (decltype(ctx))userdata1;
             if (status == WGPURequestDeviceStatus_Success) {
                 *(ctx->device) = cbDevice;
+            } else {
+                NSLog(@"[WGPU DEBUG] requestDevice failed status=%d message=%.*s", (int)status, (int)message.length, message.data);
             }
             dispatch_semaphore_signal(ctx->sem);
         };
@@ -4007,6 +4098,15 @@ extern "C" void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfa
         WGPUDeviceDescriptor deviceDesc = {};
         deviceDesc.uncapturedErrorCallbackInfo.callback = uncapturedErrorCallback;
         deviceDesc.uncapturedErrorCallbackInfo.userdata1 = &deviceCtx;
+        std::vector<WGPUFeatureName> requiredFeatureNames;
+        if (requiredFeatures && requiredFeatureCount) {
+            requiredFeatureNames.reserve(requiredFeatureCount);
+            for (uint32_t i = 0; i < requiredFeatureCount; i += 1) {
+                requiredFeatureNames.push_back((WGPUFeatureName)requiredFeatures[i]);
+            }
+            deviceDesc.requiredFeatureCount = requiredFeatureNames.size();
+            deviceDesc.requiredFeatures = requiredFeatureNames.data();
+        }
         p_wgpuAdapterRequestDevice(adapter, &deviceDesc, deviceInfo);
 
         dispatch_semaphore_wait(deviceSem, DISPATCH_TIME_FOREVER);
@@ -7151,8 +7251,9 @@ extern "C" void* wgpuViewGetNativeHandle(AbstractView *abstractView) {
 // above via displayLayer/CALayer z-ordering) is NOT included. Use the WebGPU
 // copyTextureToBuffer readback path for the same GPU-only capture from TypeScript,
 // or macOS screencapture for the full composited window (GPU + browser UI).
-// Grabs a new drawable, blits the layer's framebuffer into a CPU-readable texture, and
-// returns: [4 bytes width LE][4 bytes height LE][width*height*4 BGRA bytes]
+// Reads back the most recently presented drawable's texture (see the
+// -[CAMetalLayer nextDrawable] swizzle above), blits it into a CPU-readable
+// texture, and returns: [4 bytes width LE][4 bytes height LE][width*height*4 BGRA bytes]
 // The caller converts BGRA→RGBA if needed. Caller must free the returned pointer.
 // Returns nullptr on failure.
 extern "C" void* wgpuViewCapturePixels(AbstractView *abstractView) {
@@ -7167,27 +7268,26 @@ extern "C" void* wgpuViewCapturePixels(AbstractView *abstractView) {
         id<MTLDevice> device = metalLayer.device;
         if (!device) return;
 
-        // Use actual layer drawable size (not fixed 512x512)
-        uint32_t w = (uint32_t)metalLayer.drawableSize.width;
-        uint32_t h = (uint32_t)metalLayer.drawableSize.height;
+        // Read back from the texture Dawn's WebGPU surface most recently rendered
+        // to and presented (cached via the -[CAMetalLayer nextDrawable] swizzle
+        // above), NOT a freshly-vended drawable — a brand-new drawable from
+        // nextDrawable is guaranteed blank since nothing has rendered to it yet.
+        id<MTLTexture> srcTexture = objc_getAssociatedObject(metalLayer, kLastVendedDrawableTextureKey);
+        if (!srcTexture) return;
+
+        // Make sure the GPU work that rendered into srcTexture (and presented
+        // it) has actually finished before reading it back — see the
+        // presentDrawable: swizzle above for why this is necessary.
+        id<MTLCommandBuffer> lastPresentCmdBuf = objc_getAssociatedObject(metalLayer, kLastPresentCommandBufferKey);
+        if (lastPresentCmdBuf &&
+            lastPresentCmdBuf.status != MTLCommandBufferStatusCompleted &&
+            lastPresentCmdBuf.status != MTLCommandBufferStatusError) {
+            [lastPresentCmdBuf waitUntilCompleted];
+        }
+
+        uint32_t w = (uint32_t)srcTexture.width;
+        uint32_t h = (uint32_t)srcTexture.height;
         if (w == 0 || h == 0) return;
-
-        // Get a drawable — this gives us a texture we can blit from.
-        // The layer must have framebufferOnly = NO for texture reads.
-        BOOL wasFramebufferOnly = metalLayer.framebufferOnly;
-        metalLayer.framebufferOnly = NO;
-
-        id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
-        if (!drawable) {
-            metalLayer.framebufferOnly = wasFramebufferOnly;
-            return;
-        }
-
-        id<MTLTexture> srcTexture = drawable.texture;
-        if (!srcTexture) {
-            metalLayer.framebufferOnly = wasFramebufferOnly;
-            return;
-        }
 
         // Create a CPU-readable texture to copy into
         MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:srcTexture.pixelFormat
@@ -7197,10 +7297,7 @@ extern "C" void* wgpuViewCapturePixels(AbstractView *abstractView) {
         desc.storageMode = MTLStorageModeShared;
         desc.usage = MTLTextureUsageShaderRead;
         id<MTLTexture> readTex = [device newTextureWithDescriptor:desc];
-        if (!readTex) {
-            metalLayer.framebufferOnly = wasFramebufferOnly;
-            return;
-        }
+        if (!readTex) return;
 
         // Blit source → readable texture
         id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -7218,8 +7315,6 @@ extern "C" void* wgpuViewCapturePixels(AbstractView *abstractView) {
         [blit endEncoding];
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
-
-        metalLayer.framebufferOnly = wasFramebufferOnly;
 
         // Read pixels from the shared-storage texture
         size_t bytesPerRow = w * 4;

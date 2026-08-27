@@ -3,7 +3,7 @@ import { WGPUView } from "./core/WGPUView";
 import { GpuWindow } from "./core/GpuWindow";
 import WGPU from "./webGPU";
 import { WGPUBridge } from "./proc/native";
-import { ptr, CString, toArrayBuffer, type Pointer, JSCallback } from "bun:ffi";
+import { ptr, toArrayBuffer, type Pointer, JSCallback } from "bun:ffi";
 import { inflateSync } from "zlib";
 
 const WGPUNative = WGPU.native;
@@ -21,6 +21,8 @@ const WGPUTextureFormat_RGBA32Uint = 0x0000002A;
 const WGPUTextureFormat_RGBA16Sint = 0x00000027;
 const WGPUTextureFormat_RGBA16Uint = 0x00000026;
 const WGPUTextureFormat_RGBA16Float = 0x00000028;
+const WGPUTextureFormat_RGBA32Float = 0x00000029;
+const WGPUTextureFormat_RG16Float = 0x00000015;
 const WGPUTextureFormat_RG32Sint = 0x00000023;
 const WGPUTextureFormat_RG32Uint = 0x00000022;
 const WGPUTextureFormat_RG32Float = 0x00000021;
@@ -38,6 +40,48 @@ const WGPUTextureFormat_R8Unorm = 0x00000001;
 const WGPUTextureFormat_R8Snorm = 0x00000002;
 const WGPUTextureFormat_R8Uint = 0x00000003;
 const WGPUTextureFormat_R8Sint = 0x00000004;
+const WGPUTextureFormat_R16Float = 0x00000009;
+// Block-compression (BC1-7) formats. Desktop-relevant (Metal/Dawn on macOS).
+// Values from webgpu.h (WGPUTextureFormat enum).
+const WGPUTextureFormat_BC1RGBAUnorm = 0x00000032;
+const WGPUTextureFormat_BC1RGBAUnormSrgb = 0x00000033;
+const WGPUTextureFormat_BC2RGBAUnorm = 0x00000034;
+const WGPUTextureFormat_BC2RGBAUnormSrgb = 0x00000035;
+const WGPUTextureFormat_BC3RGBAUnorm = 0x00000036;
+const WGPUTextureFormat_BC3RGBAUnormSrgb = 0x00000037;
+const WGPUTextureFormat_BC4RUnorm = 0x00000038;
+const WGPUTextureFormat_BC4RSnorm = 0x00000039;
+const WGPUTextureFormat_BC5RGUnorm = 0x0000003A;
+const WGPUTextureFormat_BC5RGSnorm = 0x0000003B;
+const WGPUTextureFormat_BC6HRGBUfloat = 0x0000003C;
+const WGPUTextureFormat_BC6HRGBFloat = 0x0000003D;
+const WGPUTextureFormat_BC7RGBAUnorm = 0x0000003E;
+const WGPUTextureFormat_BC7RGBAUnormSrgb = 0x0000003F;
+// WGPUFeatureName values (webgpu.h), used for adapter/device feature enumeration
+// and for threading `requiredFeatures` into requestDevice().
+const WGPU_FEATURE_NAME_BY_STRING: Record<string, number> = {
+	"core-features-and-limits": 0x00000001,
+	"depth-clip-control": 0x00000002,
+	"depth32float-stencil8": 0x00000003,
+	"texture-compression-bc": 0x00000004,
+	"texture-compression-bc-sliced-3d": 0x00000005,
+	"texture-compression-etc2": 0x00000006,
+	"texture-compression-astc": 0x00000007,
+	"texture-compression-astc-sliced-3d": 0x00000008,
+	"timestamp-query": 0x00000009,
+	"indirect-first-instance": 0x0000000a,
+	"shader-f16": 0x0000000b,
+	"rg11b10ufloat-renderable": 0x0000000c,
+	"bgra8unorm-storage": 0x0000000d,
+	"float32-filterable": 0x0000000e,
+	"float32-blendable": 0x0000000f,
+	"clip-distances": 0x00000010,
+	"dual-source-blending": 0x00000011,
+	subgroups: 0x00000012,
+};
+const WGPU_FEATURE_STRING_BY_NAME: Record<number, string> = Object.fromEntries(
+	Object.entries(WGPU_FEATURE_NAME_BY_STRING).map(([k, v]) => [v, k]),
+);
 const WGPUTextureUsage_RenderAttachment = 0x0000000000000010n;
 const WGPUTextureUsage_CopyDst = 0x0000000000000002n;
 const WGPUTextureUsage_CopySrc = 0x0000000000000001n;
@@ -146,10 +190,23 @@ const WGPU_DEPTH_SLICE_UNDEFINED = 0xffffffff;
 const WGPU_KEEPALIVE: any[] = [];
 let LAST_SURFACE_PTR: number | null = null;
 let LAST_SURFACE_HAS_TEXTURE = false;
+let PRESENT_SCHEDULED = false;
 let LAST_CREATED_CONTEXT: GPUCanvasContext | null = null;
 const VIEW_CONTEXTS = new Map<number, { instance: number; surface: number; context: GPUCanvasContext }>();
 const MAP_ASYNC_RESOLVERS = new Map<number, (mapped: boolean) => void>();
 const WORK_DONE_RESOLVERS = new Map<number, (ok: boolean) => void>();
+let NEXT_WORK_DONE_REQUEST_ID = 1;
+
+function nextWorkDoneRequestId(): number {
+	while (WORK_DONE_RESOLVERS.has(NEXT_WORK_DONE_REQUEST_ID)) {
+		NEXT_WORK_DONE_REQUEST_ID = NEXT_WORK_DONE_REQUEST_ID >= Number.MAX_SAFE_INTEGER
+			? 1
+			: NEXT_WORK_DONE_REQUEST_ID + 1;
+	}
+	const requestId = NEXT_WORK_DONE_REQUEST_ID;
+	NEXT_WORK_DONE_REQUEST_ID = requestId >= Number.MAX_SAFE_INTEGER ? 1 : requestId + 1;
+	return requestId;
+}
 
 const bufferMapCallback = new JSCallback(
 	(status: number, _message: number, userdata1: number, _userdata2: number) => {
@@ -223,9 +280,13 @@ function makeStringView(str?: string | null) {
 	if (!str) {
 		return { ptr: 0, len: 0n, cstr: null };
 	}
-	const cstr = new CString(str);
-	WGPU_KEEPALIVE.push(cstr);
-	return { ptr: cstr.ptr, len: WGPU_STRLEN, cstr };
+	// Keep an explicitly-sized UTF-8 buffer alive. Passing CString.ptr with the
+	// SIZE_MAX sentinel was observed as an undefined entry point by Dawn for
+	// shader modules containing multiple functions, even though simple modules
+	// happened to auto-select successfully.
+	const encoded = new TextEncoder().encode(`${str}\0`);
+	WGPU_KEEPALIVE.push(encoded);
+	return { ptr: ptr(encoded), len: BigInt(encoded.byteLength - 1), cstr: encoded };
 }
 
 function makeSurfaceConfiguration(
@@ -839,6 +900,29 @@ function readPtr(view: DataView, offset: number) {
 	return val === 0n ? 0 : Number(val);
 }
 
+// Reads a native `WGPUSupportedFeatures { size_t featureCount; WGPUFeatureName const* features; }`
+// (16 bytes: u64 count + ptr) filled by wgpuAdapterGetFeatures/wgpuDeviceGetFeatures,
+// using the two-call size-then-fill pattern Dawn's C API uses elsewhere in this file.
+function readSupportedFeatures(getFeatures: (outPtr: number) => void): Set<string> {
+	const buffer = new ArrayBuffer(16);
+	const view = new DataView(buffer);
+	getFeatures(ptr(buffer) as any);
+	const count = readU64(view, 0);
+	const featuresPtr = readPtr(view, 8);
+	const result = new Set<string>();
+	if (count && featuresPtr) {
+		const names = new Uint32Array(toArrayBuffer(featuresPtr, 0, count * 4));
+		for (const name of names) {
+			const str = WGPU_FEATURE_STRING_BY_NAME[name];
+			if (str) result.add(str);
+		}
+		if (WGPUNative.symbols.wgpuSupportedFeaturesFreeMembers) {
+			WGPUNative.symbols.wgpuSupportedFeaturesFreeMembers(ptr(buffer) as any);
+		}
+	}
+	return result;
+}
+
 function pickSurfaceFormatAlpha(capsView: DataView, preferredFormat: number) {
 	const formatCount = readU64(capsView, 16);
 	const formatPtr = readPtr(capsView, 24);
@@ -947,19 +1031,62 @@ class GPUQueue {
 			// caller can copyTextureToBuffer before presenting manually.
 			if (LAST_CREATED_CONTEXT?._deferPresent) {
 				// Leave LAST_SURFACE_HAS_TEXTURE true — finishCapture() will present
-			} else {
-				LAST_SURFACE_HAS_TEXTURE = false;
-				WGPUBridge.surfacePresent(LAST_SURFACE_PTR as any);
+			} else if (!PRESENT_SCHEDULED) {
+				// Multi-pass pipelines (e.g. three.js RenderPipeline/QuadMesh
+				// post-processing) issue several queue.submit() calls within a
+				// single synchronous frame — an offscreen scene pass followed by
+				// a compositing pass that writes to the canvas surface texture.
+				// Presenting (and thereby destroying) the surface texture after
+				// the FIRST submit breaks any later pass in the same frame that
+				// still needs to write to it ("Destroyed texture ... used in a
+				// submit"). Defer the actual present to a microtask so it runs
+				// once, after all synchronous submits for this frame have
+				// completed, instead of eagerly after every submit.
+				PRESENT_SCHEDULED = true;
+				queueMicrotask(() => {
+					PRESENT_SCHEDULED = false;
+					if (
+						LAST_SURFACE_PTR &&
+						LAST_SURFACE_HAS_TEXTURE &&
+						!LAST_CREATED_CONTEXT?._deferPresent
+					) {
+						LAST_SURFACE_HAS_TEXTURE = false;
+						WGPUBridge.surfacePresent(LAST_SURFACE_PTR as any);
+					}
+				});
 			}
 		}
 	}
-	writeBuffer(buffer: GPUBuffer, offset: number, data: ArrayBufferView) {
+	writeBuffer(
+		buffer: GPUBuffer,
+		bufferOffset: number,
+		data: ArrayBufferView | ArrayBuffer,
+		dataOffset = 0,
+		size?: number,
+	) {
+		// Per the WebGPU spec, `dataOffset`/`size` are counted in elements of
+		// `data`'s type (bytes for a plain ArrayBuffer), not raw bytes. Passing
+		// them through as raw bytes silently over-writes past small buffers
+		// (e.g. a growing shared uniform-update scratch array sliced per-call).
+		const elementSize = ArrayBuffer.isView(data)
+			? (data as any).BYTES_PER_ELEMENT ?? 1
+			: 1;
+		const totalElements = ArrayBuffer.isView(data)
+			? (data as any).length
+			: (data as ArrayBuffer).byteLength;
+		const sizeElements = size ?? totalElements - dataOffset;
+		const byteOffset =
+			(ArrayBuffer.isView(data) ? data.byteOffset : 0) +
+			dataOffset * elementSize;
+		const byteLength = sizeElements * elementSize;
+		const srcBuffer = ArrayBuffer.isView(data) ? data.buffer : data;
+		const view = new Uint8Array(srcBuffer as ArrayBuffer, byteOffset, byteLength);
 		WGPUNative.symbols.wgpuQueueWriteBuffer(
 			this.ptr,
 			buffer.ptr,
-			BigInt(offset),
-			ptr(data),
-			data.byteLength,
+			BigInt(bufferOffset),
+			ptr(view),
+			byteLength,
 		);
 	}
 	writeTexture(
@@ -969,7 +1096,60 @@ class GPUQueue {
 		size: { width: number; height: number; depthOrArrayLayers?: number },
 	) {
 		if (!data || data.byteLength === 0) return;
-		let bytesPerPixel = bytesPerPixelForFormat(destination.texture.format);
+		const destFormat = destination.texture.format;
+		if (destFormat !== undefined && isBCFormat(destFormat)) {
+			// Block-compressed formats: bytesPerRow/rowsPerImage are counted in
+			// 4x4 blocks, not pixels, so the uncompressed pixel-inference heuristics
+			// below don't apply. Trust the caller's size/layout directly.
+			const width = size.width;
+			const height = size.height;
+			const layers = size.depthOrArrayLayers ?? 1;
+			if (width <= 0 || height <= 0 || layers <= 0) return;
+			const blockBytes = bcBlockBytes(destFormat);
+			const blocksWide = Math.ceil(width / 4);
+			const blocksHigh = Math.ceil(height / 4);
+			let bytesPerRow = dataLayout.bytesPerRow ?? blocksWide * blockBytes;
+			const rowsPerImage = dataLayout.rowsPerImage ?? blocksHigh;
+
+			let writeData: ArrayBufferView = data;
+			if (bytesPerRow % 256 !== 0) {
+				const minRowBytes = blocksWide * blockBytes;
+				const aligned = alignTo(bytesPerRow, 256);
+				writeData = repackTextureData(
+					data,
+					bytesPerRow,
+					aligned,
+					minRowBytes,
+					blocksHigh,
+					rowsPerImage,
+					layers,
+				);
+				bytesPerRow = aligned;
+			}
+
+			const texInfo = makeTexelCopyTextureInfo(
+				destination.texture.ptr,
+				destination.mipLevel ?? 0,
+				destination.origin ?? {},
+			);
+			const layout = makeTexelCopyBufferLayout(
+				(dataLayout as { offset?: number }).offset ?? 0,
+				bytesPerRow,
+				rowsPerImage,
+			);
+			const extent = makeExtent3D(width, height, layers);
+			WGPU_KEEPALIVE.push(texInfo.buffer, layout.buffer, extent.buffer);
+			WGPUNative.symbols.wgpuQueueWriteTexture(
+				this.ptr,
+				texInfo.ptr as any,
+				ptr(writeData),
+				writeData.byteLength,
+				layout.ptr as any,
+				extent.ptr as any,
+			);
+			return;
+		}
+		let bytesPerPixel = bytesPerPixelForFormat(destFormat);
 		let width =
 			Number.isFinite(size.width) && size.width > 0
 				? size.width
@@ -985,35 +1165,9 @@ class GPUQueue {
 				: Math.max(1, dataLayout.rowsPerImage ?? 1);
 		const layers = size.depthOrArrayLayers ?? 1;
 		if (width <= 0 || height <= 0 || layers <= 0) return;
-		const inferredBpp = Math.floor(
-			data.byteLength / Math.max(1, width * height * layers),
-		);
-		if (inferredBpp > bytesPerPixel) {
-			bytesPerPixel = inferredBpp;
-		}
-		const exactRGBABytes = width * height * layers * 4;
-		if (data.byteLength === exactRGBABytes) {
-			bytesPerPixel = 4;
-		}
 		let minBytesPerRow = Math.max(1, width * bytesPerPixel);
-		const minExpectedSize = minBytesPerRow * height * layers;
-		if (data.byteLength > minExpectedSize && height > 0) {
-			const widthFromData = Math.floor(
-				data.byteLength / Math.max(1, height * layers * bytesPerPixel),
-			);
-			if (widthFromData > width) {
-				width = widthFromData;
-				minBytesPerRow = Math.max(1, width * bytesPerPixel);
-			}
-		}
 		let bytesPerRow = dataLayout.bytesPerRow ?? minBytesPerRow;
 		if (bytesPerRow < minBytesPerRow) bytesPerRow = minBytesPerRow;
-		const derivedRowBytes = Math.ceil(
-			data.byteLength / Math.max(1, height * layers),
-		);
-		if (bytesPerRow < derivedRowBytes) {
-			bytesPerRow = derivedRowBytes;
-		}
 		let rowsPerImage = dataLayout.rowsPerImage ?? height;
 		if (rowsPerImage === 0) rowsPerImage = height;
 
@@ -1063,39 +1217,63 @@ class GPUQueue {
 		);
 	}
 	onSubmittedWorkDone() {
-		const callbackPtr = (queueWorkDoneCallback as any).ptr ?? queueWorkDoneCallback;
-		const info = makeQueueWorkDoneCallbackInfo(
-			Number(callbackPtr),
-			this.ptr,
-			0,
-		);
-		WGPU_KEEPALIVE.push(info.buffer);
-		WGPUBridge.queueOnSubmittedWorkDone(
-			this.ptr as any,
-			info.ptr as any,
-		);
 		return new Promise<boolean>((resolve) => {
 			let done = false;
-			const resolveOnce = () => {
+			const requestId = nextWorkDoneRequestId();
+			const resolveOnce = (ok: boolean) => {
 				if (done) return;
 				done = true;
-				resolve(true);
+				if (WORK_DONE_RESOLVERS.get(requestId) === resolveOnce) {
+					WORK_DONE_RESOLVERS.delete(requestId);
+				}
+				resolve(ok);
 			};
-			WORK_DONE_RESOLVERS.set(this.ptr, () => resolveOnce());
+			// AllowSpontaneous permits Dawn to invoke the callback during native
+			// registration. Install the resolver first or an already-idle queue loses
+			// its completion and waits for the five-second fallback every time. Each
+			// request owns a distinct userdata key so concurrent calls cannot replace
+			// one another's resolver.
+			WORK_DONE_RESOLVERS.set(requestId, resolveOnce);
+			const callbackPtr = (queueWorkDoneCallback as any).ptr ?? queueWorkDoneCallback;
+			const info = makeQueueWorkDoneCallbackInfo(
+				Number(callbackPtr),
+				requestId,
+				0,
+			);
+			WGPU_KEEPALIVE.push(info.buffer);
+			const futureId = WGPUBridge.queueOnSubmittedWorkDone(
+				this.ptr as any,
+				info.ptr as any,
+			);
+			if (futureId === 0n) {
+				resolveOnce(false);
+				return;
+			}
 
 			const start = Date.now();
 			const poll = () => {
 				if (done) return;
 				try {
-					if ((this as any)._device?.instancePtr) {
+					const instancePtr = (this as any)._device?.instancePtr;
+					if (
+						instancePtr &&
+						futureId !== 0n &&
+						WGPUBridge.instanceWaitAny(instancePtr, futureId, 0n) === 1
+					) {
+						// Bun's threadsafe JSCallback may be queued after Dawn reports the
+						// future complete. Resolve from the future as well as the callback.
+						resolveOnce(true);
+						return;
+					}
+					if (instancePtr) {
 						WGPUNative.symbols.wgpuInstanceProcessEvents(
-							(this as any)._device.instancePtr,
+							instancePtr,
 						);
 					}
 					WGPUNative.symbols.wgpuDeviceTick((this as any)._device?.ptr ?? 0);
 				} catch {}
 				if (Date.now() - start > 5000) {
-					resolve(false);
+					resolveOnce(false);
 					return;
 				}
 				setTimeout(poll, 5);
@@ -1112,6 +1290,9 @@ class GPUDevice {
 	limits: Record<string, number> = {};
 	_uncapturedErrorListeners: ((event: { error: Error }) => void)[] = [];
 	instancePtr: number | null = null;
+	// Per the WebGPU spec, `lost` is a promise that resolves if/when the device
+	// is lost. We never proactively lose devices, so it simply stays pending.
+	lost: Promise<{ reason: string; message: string }> = new Promise(() => {});
 	constructor(ptr: number, instancePtr?: number) {
 		if (!ptr) {
 			throw new Error("Failed to create WGPU device");
@@ -1158,8 +1339,12 @@ class GPUDevice {
 		sampleCount?: number;
 		viewFormats?: string[];
 	}) {
-		const mappedFormat =
-			mapTextureFormat(descriptor.format) ?? WGPUTextureFormat_BGRA8Unorm;
+		const mappedFormat = mapTextureFormat(descriptor.format);
+		if (mappedFormat === undefined) {
+			throw new Error(
+				`createTexture: unsupported/unrecognized GPUTextureFormat "${descriptor.format}"`,
+			);
+		}
 		const rawSample = Number(descriptor.sampleCount ?? 1);
 		let sampleCount = Number.isFinite(rawSample) ? rawSample : 1;
 		if (sampleCount > 1 && isIntegerFormat(mappedFormat)) {
@@ -1255,9 +1440,15 @@ class GPUDevice {
 				texture: normalized.texture
 					? {
 							sampleType: mapTextureSampleType(normalized.texture.sampleType),
-							viewDimension: mapTextureViewDimension(
-								normalized.texture.viewDimension,
-							),
+							// GPUTextureBindingLayout.viewDimension defaults to "2d" per
+							// spec; WGPUTextureViewDimensionUndefined (0) is not a valid
+							// substitute here (unlike a GPUTextureViewDescriptor, where
+							// Undefined legitimately means "derive from texture") — Dawn
+							// mishandles it, causing the bound texture to sample as nothing
+							// instead of raising a catchable JS error.
+							viewDimension:
+								mapTextureViewDimension(normalized.texture.viewDimension) ??
+								WGPUTextureViewDimension_2D,
 							multisampled: !!normalized.texture.multisampled,
 					  }
 					: undefined,
@@ -1267,9 +1458,10 @@ class GPUDevice {
 								normalized.storageTexture.access,
 							),
 							format: mapTextureFormat(normalized.storageTexture.format),
-							viewDimension: mapTextureViewDimension(
-								normalized.storageTexture.viewDimension,
-							),
+							viewDimension:
+								mapTextureViewDimension(
+									normalized.storageTexture.viewDimension,
+								) ?? WGPUTextureViewDimension_2D,
 					  }
 					: undefined,
 			});
@@ -1380,11 +1572,13 @@ class GPUDevice {
 			this.ptr,
 			desc.ptr as any,
 		);
-		return new GPUShaderModule(modulePtr);
+		return new GPUShaderModule(modulePtr, descriptor.code);
 	}
 	createRenderPipeline(descriptor: any) {
 		const vertexModule = descriptor.vertex.module as GPUShaderModule;
-		const vertexEntry = makeStringView(descriptor.vertex.entryPoint ?? "main");
+		const vertexEntry = makeStringView(
+			descriptor.vertex.entryPoint || vertexModule.entryPoint("vertex") || "main",
+		);
 		const vertexBuffers = descriptor.vertex.buffers ?? [];
 		const vertexLayouts: ArrayBuffer[] = [];
 		const vertexLayoutPtrs: number[] = [];
@@ -1435,7 +1629,9 @@ class GPUDevice {
 		let fragmentStatePtr: number | null = null;
 		if (descriptor.fragment) {
 			const fragModule = descriptor.fragment.module as GPUShaderModule;
-			const fragEntry = makeStringView(descriptor.fragment.entryPoint ?? "main");
+			const fragEntry = makeStringView(
+				descriptor.fragment.entryPoint || fragModule.entryPoint("fragment") || "main",
+			);
 			const targets = descriptor.fragment.targets ?? [];
 			const targetBuf = new ArrayBuffer(targets.length * 32);
 			targets.forEach((t: any, i: number) => {
@@ -1528,12 +1724,26 @@ class GPUDevice {
 		);
 		return new GPURenderPipeline(pipelinePtr);
 	}
+	// WebGPU spec requires createRenderPipelineAsync/createComputePipelineAsync to
+	// return a Promise<GPU*Pipeline>. Three.js's WebGPUBackend calls these (not the
+	// sync variants) whenever a pipeline is compiled via renderer.compileAsync() —
+	// without them, the calls throw "not a function", which WebGPUBackend swallows
+	// in an empty catch, leaving the render object's pipeline permanently marked
+	// "not ready" so it silently never draws again, with no error surfaced anywhere.
+	// wgpuDeviceCreateRenderPipeline/wgpuDeviceCreateComputePipeline are fast enough
+	// synchronous native calls that wrapping them in a resolved Promise satisfies the
+	// spec contract without needing the native Future-based async entry points.
+	createRenderPipelineAsync(descriptor: any) {
+		return Promise.resolve(this.createRenderPipeline(descriptor));
+	}
 	createComputePipeline(descriptor: {
 		layout?: GPUPipelineLayout | "auto";
 		compute: { module: GPUShaderModule; entryPoint?: string };
 	}) {
 		const module = descriptor.compute.module as GPUShaderModule;
-		const entry = makeStringView(descriptor.compute.entryPoint ?? "main");
+		const entry = makeStringView(
+			descriptor.compute.entryPoint || descriptor.compute.module.entryPoint("compute") || "main",
+		);
 		const stage = makeProgrammableStageDescriptor(
 			module.ptr,
 			{ ptr: entry.ptr as any, len: entry.len },
@@ -1551,6 +1761,12 @@ class GPUDevice {
 			pipelineDesc.ptr as any,
 		);
 		return new GPUComputePipeline(pipelinePtr);
+	}
+	createComputePipelineAsync(descriptor: {
+		layout?: GPUPipelineLayout | "auto";
+		compute: { module: GPUShaderModule; entryPoint?: string };
+	}) {
+		return Promise.resolve(this.createComputePipeline(descriptor));
 	}
 	createCommandEncoder() {
 		const desc = makeCommandEncoderDescriptor();
@@ -1762,8 +1978,13 @@ class GPUPipelineLayout {
 
 class GPUShaderModule {
 	ptr: number;
-	constructor(ptr: number) {
+	private readonly code: string;
+	constructor(ptr: number, code = "") {
 		this.ptr = ptr;
+		this.code = code;
+	}
+	entryPoint(stage: "vertex" | "fragment" | "compute") {
+		return this.code.match(new RegExp(`@${stage}\\s+fn\\s+([A-Za-z_][A-Za-z0-9_]*)`))?.[1];
 	}
 }
 
@@ -1852,16 +2073,20 @@ class GPUCommandEncoder {
 			if (viewFormat && !isDepthFormat(viewFormat)) {
 				// Skip invalid depth/stencil view attachments.
 			} else {
+				// WGPU requires stencilLoadOp/StoreOp to stay "undefined" (0) when
+				// the attachment's format has no stencil aspect (e.g. depth24plus) —
+				// setting Clear/Store on a stencil-less view is a validation error.
+				const withStencil = hasStencilAspect(viewFormat);
 				const depth = makeRenderPassDepthStencilAttachment({
 					view: d.view.ptr,
 					depthLoadOp: mapLoadOp(d.depthLoadOp),
 					depthStoreOp: mapStoreOp(d.depthStoreOp),
 					depthClearValue: d.depthClearValue ?? 1,
 					depthReadOnly: !!d.depthReadOnly,
-					stencilLoadOp: mapLoadOp(d.stencilLoadOp),
-					stencilStoreOp: mapStoreOp(d.stencilStoreOp),
+					stencilLoadOp: withStencil ? mapLoadOp(d.stencilLoadOp) : 0,
+					stencilStoreOp: withStencil ? mapStoreOp(d.stencilStoreOp) : 0,
 					stencilClearValue: d.stencilClearValue ?? 0,
-					stencilReadOnly: !!d.stencilReadOnly,
+					stencilReadOnly: withStencil ? !!d.stencilReadOnly : true,
 				});
 				WGPU_KEEPALIVE.push(depth.buffer);
 				depthPtr = depth.ptr as any;
@@ -1903,20 +2128,76 @@ class GPUCommandEncoder {
 		},
 		size: { width: number; height: number; depthOrArrayLayers?: number },
 	) {
-		const offset = source.offset ?? 0;
-		const mapped = source.buffer.getMappedRange(0, source.buffer.size);
-		const data =
-			offset > 0
-				? new Uint8Array(mapped, offset)
-				: new Uint8Array(mapped);
-		this._device.queue.writeTexture(
-			destination,
-			data,
-			{
-				bytesPerRow: source.bytesPerRow ?? 0,
-				rowsPerImage: source.rowsPerImage ?? 0,
-			},
-			size,
+		const srcBuf = new ArrayBuffer(24);
+		const srcView = new DataView(srcBuf);
+		srcView.setBigUint64(0, BigInt(source.offset ?? 0), true);
+		srcView.setUint32(8, source.bytesPerRow ?? 0, true);
+		srcView.setUint32(12, source.rowsPerImage ?? 0, true);
+		srcView.setBigUint64(16, BigInt(source.buffer.ptr), true);
+		WGPU_KEEPALIVE.push(srcBuf);
+
+		const dstBuf = new ArrayBuffer(32);
+		const dstView = new DataView(dstBuf);
+		dstView.setBigUint64(0, BigInt(destination.texture.ptr), true);
+		dstView.setUint32(8, destination.mipLevel ?? 0, true);
+		dstView.setUint32(12, destination.origin?.x ?? 0, true);
+		dstView.setUint32(16, destination.origin?.y ?? 0, true);
+		dstView.setUint32(20, destination.origin?.z ?? 0, true);
+		dstView.setUint32(24, WGPUTextureAspect_All, true);
+		WGPU_KEEPALIVE.push(dstBuf);
+
+		const sizeBuf = new ArrayBuffer(12);
+		const sizeView = new DataView(sizeBuf);
+		sizeView.setUint32(0, size.width, true);
+		sizeView.setUint32(4, size.height, true);
+		sizeView.setUint32(8, size.depthOrArrayLayers ?? 1, true);
+		WGPU_KEEPALIVE.push(sizeBuf);
+
+		WGPUNative.symbols.wgpuCommandEncoderCopyBufferToTexture(
+			this.ptr,
+			ptr(srcBuf) as any,
+			ptr(dstBuf) as any,
+			ptr(sizeBuf) as any,
+		);
+	}
+	copyTextureToTexture(
+		source: { texture: GPUTexture; mipLevel?: number; origin?: { x?: number; y?: number; z?: number } },
+		destination: { texture: GPUTexture; mipLevel?: number; origin?: { x?: number; y?: number; z?: number } },
+		size: { width: number; height: number; depthOrArrayLayers?: number },
+	) {
+		const textureInfo = (copy: typeof source) => {
+			const buffer = new ArrayBuffer(32);
+			const view = new DataView(buffer);
+			view.setBigUint64(0, BigInt(copy.texture.ptr), true);
+			view.setUint32(8, copy.mipLevel ?? 0, true);
+			view.setUint32(12, copy.origin?.x ?? 0, true);
+			view.setUint32(16, copy.origin?.y ?? 0, true);
+			view.setUint32(20, copy.origin?.z ?? 0, true);
+			view.setUint32(24, WGPUTextureAspect_All, true);
+			WGPU_KEEPALIVE.push(buffer);
+			return buffer;
+		};
+		const srcBuf = textureInfo(source);
+		const dstBuf = textureInfo(destination);
+		const sizeBuf = new ArrayBuffer(12);
+		const sizeView = new DataView(sizeBuf);
+		sizeView.setUint32(0, size.width, true);
+		sizeView.setUint32(4, size.height, true);
+		sizeView.setUint32(8, size.depthOrArrayLayers ?? 1, true);
+		WGPU_KEEPALIVE.push(sizeBuf);
+		WGPUNative.symbols.wgpuCommandEncoderCopyTextureToTexture(
+			this.ptr,
+			ptr(srcBuf) as any,
+			ptr(dstBuf) as any,
+			ptr(sizeBuf) as any,
+		);
+	}
+	clearBuffer(buffer: GPUBuffer, offset = 0, size?: number) {
+		WGPUNative.symbols.wgpuCommandEncoderClearBuffer(
+			this.ptr,
+			buffer.ptr,
+			BigInt(offset),
+			BigInt(size ?? Math.max(0, buffer.size - offset)),
 		);
 	}
 	copyBufferToBuffer(
@@ -2138,19 +2419,48 @@ class GPUAdapter {
 		this.instancePtr = instancePtr;
 		this.surfacePtr = surfacePtr;
 	}
-	async requestDevice() {
+	async requestDevice(options?: { requiredFeatures?: string[] }) {
 		const adapterDevice = new BigUint64Array(2);
+		let requiredFeaturesPtr: number | null = null;
+		let requiredFeatureCount = 0;
+		let requiredFeaturesArr: Uint32Array | null = null;
+		if (options?.requiredFeatures?.length) {
+			requiredFeaturesArr = new Uint32Array(
+				options.requiredFeatures.map((name) => {
+					const value = WGPU_FEATURE_NAME_BY_STRING[name];
+					if (value === undefined) {
+						throw new Error(`requestDevice: unknown required feature "${name}"`);
+					}
+					return value;
+				}),
+			);
+			requiredFeaturesPtr = ptr(requiredFeaturesArr) as any;
+			requiredFeatureCount = requiredFeaturesArr.length;
+		}
 		WGPUBridge.createAdapterDeviceMainThread(
 			this.instancePtr as any,
 			this.surfacePtr as any,
 			ptr(adapterDevice),
+			requiredFeaturesPtr as any,
+			requiredFeatureCount,
 		);
+		if (requiredFeaturesArr) WGPU_KEEPALIVE.push(requiredFeaturesArr);
+		const adapterPtr = adapterDevice[0];
 		const devicePtr = adapterDevice[1];
 		if (devicePtr === 0n) {
 			throw new Error("Failed to create WGPU device");
 		}
+		if (adapterPtr !== 0n) {
+			this.features = readSupportedFeatures((outPtr) =>
+				WGPUNative.symbols.wgpuAdapterGetFeatures(Number(adapterPtr) as any, outPtr as any),
+			);
+		}
 		const device = Number(devicePtr);
-		return new GPUDevice(device, this.instancePtr);
+		const gpuDevice = new GPUDevice(device, this.instancePtr);
+		gpuDevice.features = readSupportedFeatures((outPtr) =>
+			WGPUNative.symbols.wgpuDeviceGetFeatures(device as any, outPtr as any),
+		);
+		return gpuDevice;
 	}
 }
 
@@ -2489,6 +2799,8 @@ function mapTextureFormat(format?: string | number | null) {
 			return WGPUTextureFormat_R8Uint;
 		case "r8sint":
 			return WGPUTextureFormat_R8Sint;
+		case "r16float":
+			return WGPUTextureFormat_R16Float;
 		case "rg8unorm":
 			return WGPUTextureFormat_RG8Unorm;
 		case "rg8snorm":
@@ -2525,6 +2837,10 @@ function mapTextureFormat(format?: string | number | null) {
 			return WGPUTextureFormat_RG32Sint;
 		case "rgba16float":
 			return WGPUTextureFormat_RGBA16Float;
+		case "rgba32float":
+			return WGPUTextureFormat_RGBA32Float;
+		case "rg16float":
+			return WGPUTextureFormat_RG16Float;
 		case "rgba16uint":
 			return WGPUTextureFormat_RGBA16Uint;
 		case "rgba16sint":
@@ -2543,8 +2859,53 @@ function mapTextureFormat(format?: string | number | null) {
 			return WGPUTextureFormat_Depth16Unorm;
 		case "depth32float-stencil8":
 			return WGPUTextureFormat_Depth32FloatStencil8;
+		case "bc1-rgba-unorm":
+			return WGPUTextureFormat_BC1RGBAUnorm;
+		case "bc1-rgba-unorm-srgb":
+			return WGPUTextureFormat_BC1RGBAUnormSrgb;
+		case "bc2-rgba-unorm":
+			return WGPUTextureFormat_BC2RGBAUnorm;
+		case "bc2-rgba-unorm-srgb":
+			return WGPUTextureFormat_BC2RGBAUnormSrgb;
+		case "bc3-rgba-unorm":
+			return WGPUTextureFormat_BC3RGBAUnorm;
+		case "bc3-rgba-unorm-srgb":
+			return WGPUTextureFormat_BC3RGBAUnormSrgb;
+		case "bc4-r-unorm":
+			return WGPUTextureFormat_BC4RUnorm;
+		case "bc4-r-snorm":
+			return WGPUTextureFormat_BC4RSnorm;
+		case "bc5-rg-unorm":
+			return WGPUTextureFormat_BC5RGUnorm;
+		case "bc5-rg-snorm":
+			return WGPUTextureFormat_BC5RGSnorm;
+		case "bc6h-rgb-ufloat":
+			return WGPUTextureFormat_BC6HRGBUfloat;
+		case "bc6h-rgb-float":
+			return WGPUTextureFormat_BC6HRGBFloat;
+		case "bc7-rgba-unorm":
+			return WGPUTextureFormat_BC7RGBAUnorm;
+		case "bc7-rgba-unorm-srgb":
+			return WGPUTextureFormat_BC7RGBAUnormSrgb;
 		default:
 			return undefined;
+	}
+}
+
+function isBCFormat(format: number) {
+	return format >= WGPUTextureFormat_BC1RGBAUnorm && format <= WGPUTextureFormat_BC7RGBAUnormSrgb;
+}
+
+// Bytes per 4x4 block for each BC variant. BC1/BC4 use 8 bytes/block; the rest use 16.
+function bcBlockBytes(format: number) {
+	switch (format) {
+		case WGPUTextureFormat_BC1RGBAUnorm:
+		case WGPUTextureFormat_BC1RGBAUnormSrgb:
+		case WGPUTextureFormat_BC4RUnorm:
+		case WGPUTextureFormat_BC4RSnorm:
+			return 8;
+		default:
+			return 16;
 	}
 }
 
@@ -2573,6 +2934,13 @@ function isDepthFormat(format: number) {
 		format === WGPUTextureFormat_Depth24PlusStencil8 ||
 		format === WGPUTextureFormat_Depth32Float ||
 		format === WGPUTextureFormat_Depth16Unorm ||
+		format === WGPUTextureFormat_Depth32FloatStencil8
+	);
+}
+
+function hasStencilAspect(format: number) {
+	return (
+		format === WGPUTextureFormat_Depth24PlusStencil8 ||
 		format === WGPUTextureFormat_Depth32FloatStencil8
 	);
 }
@@ -3074,6 +3442,44 @@ const webgpu = {
 		nav.gpu = webgpu.navigator;
 		(globalThis as any).navigator = nav;
 		(globalThis as any).GPUCanvasContext = GPUCanvasContext;
+		// Standard WebGPU global usage/flag constants (spec: these live on the
+		// global object in browsers, e.g. `window.GPUTextureUsage`). Values match
+		// the WebGPU spec bit flags, which line up with the native WGPU enum bits.
+		(globalThis as any).GPUTextureUsage = {
+			COPY_SRC: 0x01,
+			COPY_DST: 0x02,
+			TEXTURE_BINDING: 0x04,
+			STORAGE_BINDING: 0x08,
+			RENDER_ATTACHMENT: 0x10,
+		};
+		(globalThis as any).GPUBufferUsage = {
+			MAP_READ: 0x0001,
+			MAP_WRITE: 0x0002,
+			COPY_SRC: 0x0004,
+			COPY_DST: 0x0008,
+			INDEX: 0x0010,
+			VERTEX: 0x0020,
+			UNIFORM: 0x0040,
+			STORAGE: 0x0080,
+			INDIRECT: 0x0100,
+			QUERY_RESOLVE: 0x0200,
+		};
+		(globalThis as any).GPUShaderStage = {
+			VERTEX: 0x1,
+			FRAGMENT: 0x2,
+			COMPUTE: 0x4,
+		};
+		(globalThis as any).GPUColorWrite = {
+			RED: 0x1,
+			GREEN: 0x2,
+			BLUE: 0x4,
+			ALPHA: 0x8,
+			ALL: 0xf,
+		};
+		(globalThis as any).GPUMapMode = {
+			READ: 0x0001,
+			WRITE: 0x0002,
+		};
 	},
 };
 

@@ -7626,7 +7626,7 @@ ELECTROBUN_EXPORT void wgpuRunGPUTest(void* abstractView) {
     });
 }
 
-ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice) {
+ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice, uint32_t* requiredFeatures, uint32_t requiredFeatureCount) {
     if (!ensureWgpuTestSymbols()) return;
     runOnMainThreadSyncVoid([&]() {
         WGPUInstance instance = (WGPUInstance)instancePtr;
@@ -7707,6 +7707,15 @@ ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void
         WGPUDeviceDescriptor deviceDesc = {};
         deviceDesc.uncapturedErrorCallbackInfo.callback = gpuTestUncapturedErrorCallback;
         deviceDesc.uncapturedErrorCallbackInfo.userdata1 = &deviceCtx;
+        std::vector<WGPUFeatureName> requiredFeatureNames;
+        if (requiredFeatures && requiredFeatureCount) {
+            requiredFeatureNames.reserve(requiredFeatureCount);
+            for (uint32_t i = 0; i < requiredFeatureCount; i += 1) {
+                requiredFeatureNames.push_back((WGPUFeatureName)requiredFeatures[i]);
+            }
+            deviceDesc.requiredFeatureCount = requiredFeatureNames.size();
+            deviceDesc.requiredFeatures = requiredFeatureNames.data();
+        }
         p_wgpuAdapterRequestDevice(adapter, &deviceDesc, deviceInfo);
 
         {

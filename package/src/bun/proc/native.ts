@@ -447,7 +447,7 @@ export const native = (() => {
 				returns: FFIType.void,
 			},
 			wgpuCreateAdapterDeviceMainThread: {
-				args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+				args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32],
 				returns: FFIType.void,
 			},
 			wgpuCreateSurfaceForView: {
@@ -1362,10 +1362,10 @@ window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.me
 			// Copy and BGRA→RGBA swizzle in one pass
 			const pixels = new Uint8Array(pixelBytes);
 			for (let i = 0; i < pixelBytes; i += 4) {
-				pixels[i]     = nativeView[i + 2]; // R ← B
-				pixels[i + 1] = nativeView[i + 1]; // G ← G
-				pixels[i + 2] = nativeView[i];     // B ← R
-				pixels[i + 3] = nativeView[i + 3]; // A ← A
+				pixels[i]     = nativeView[i + 2]!; // R ← B
+				pixels[i + 1] = nativeView[i + 1]!; // G ← G
+				pixels[i + 2] = nativeView[i]!;     // B ← R
+				pixels[i + 3] = nativeView[i + 3]!; // A ← A
 			}
 			native.symbols.wgpuViewFreePixels(bufPtr);
 			return { width, height, pixels };
@@ -1754,11 +1754,15 @@ export const WGPUBridge = {
 		instancePtr: Pointer,
 		surfacePtr: Pointer,
 		outAdapterDevicePtr: Pointer,
+		requiredFeaturesPtr: Pointer | null = null,
+		requiredFeatureCount = 0,
 	) =>
 		native.symbols.wgpuCreateAdapterDeviceMainThread(
 			instancePtr as any,
 			surfacePtr as any,
 			outAdapterDevicePtr as any,
+			requiredFeaturesPtr as any,
+			requiredFeatureCount,
 		),
 	createSurfaceForView: (instancePtr: Pointer, viewPtr: Pointer): Pointer | null => {
 		if (!native?.symbols?.wgpuCreateSurfaceForView) return null;
