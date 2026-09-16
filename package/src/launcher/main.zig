@@ -140,7 +140,9 @@ pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
     var exePathBuffer: [1024]u8 = undefined;
-    const exe_dir = try std.fs.selfExeDirPath(exePathBuffer[0..]);
+    const exe_dir_view = try std.fs.selfExeDirPath(exePathBuffer[0..]);
+    const exe_dir = try alloc.dupe(u8, exe_dir_view);
+    defer alloc.free(exe_dir);
 
     std.debug.print("Launcher starting on {s}...\n", .{@tagName(builtin.os.tag)});
     std.debug.print("Current directory: {s}\n", .{exe_dir});
@@ -154,23 +156,25 @@ pub fn main() !void {
     }
 
     // Platform-specific paths
-    var argv: []const []const u8 = undefined;
-    var resources_path: []u8 = undefined;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
+    const argv = try arena_alloc.alloc([]const u8, 2);
+    var resources_path: []u8 = undefined;
 
     switch (builtin.os.tag) {
         .macos => {
             // macOS: launcher is in MacOS/, resources in Resources/
             resources_path = try std.fs.path.join(arena_alloc, &.{ exe_dir, "..", "Resources", "main.js" });
-            argv = &[_][]const u8{ "./bun", resources_path };
+            argv[0] = "./bun";
+            argv[1] = resources_path;
         },
         .linux, .windows => {
             // Linux/Windows: launcher is in bin/, resources in Resources/
             resources_path = try std.fs.path.join(arena_alloc, &.{ exe_dir, "..", "Resources", "main.js" });
             const bun_name = if (builtin.os.tag == .windows) "bun.exe" else "bun";
-            argv = &[_][]const u8{ try std.fs.path.join(arena_alloc, &.{ exe_dir, bun_name }), resources_path };
+            argv[0] = try std.fs.path.join(arena_alloc, &.{ exe_dir, bun_name });
+            argv[1] = resources_path;
         },
         else => @panic("Unsupported platform"),
     }
@@ -238,13 +242,19 @@ pub fn main() !void {
     std.debug.print("Spawning: {s} {s}\n", .{ argv[0], if (argv.len > 1) argv[1] else "" });
 
     // Check if console mode is forced via environment variable
-    const force_console = if (std.process.getEnvVarOwned(arena_alloc, "ELECTROBUN_CONSOLE")) |val| blk: {
-        defer arena_alloc.free(val);
-        break :blk std.mem.eql(u8, val, "1");
-    } else |_| false;
+    const force_console = if (builtin.os.tag == .windows)
+        if (std.process.getEnvVarOwned(arena_alloc, "ELECTROBUN_CONSOLE")) |val| blk: {
+            defer arena_alloc.free(val);
+            break :blk std.mem.eql(u8, val, "1");
+        } else |_| false
+    else
+        false;
 
     // Check if this is a dev build by reading version.json, or if console is forced
-    const is_dev_build = force_console or isDevBuild(arena_alloc, exe_dir);
+    const is_dev_build = if (builtin.os.tag == .windows)
+        force_console or isDevBuild(arena_alloc, exe_dir)
+    else
+        false;
     if (force_console) {
         std.debug.print("Console mode forced via ELECTROBUN_CONSOLE=1\n", .{});
     } else if (is_dev_build) {
