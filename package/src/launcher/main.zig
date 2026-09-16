@@ -165,7 +165,13 @@ pub fn main() !void {
     switch (builtin.os.tag) {
         .macos => {
             // macOS: launcher is in MacOS/, resources in Resources/
-            resources_path = try std.fs.path.join(arena_alloc, &.{ exe_dir, "..", "Resources", "main.js" });
+            // Avoid std.fs.path.join here: Zig 0.13 miscompiles this call for
+            // x86_64 macOS and crashes before Bun starts. The launcher cwd is
+            // Contents/MacOS, so this fixed relative suffix is sufficient.
+            const resources_suffix = "/../Resources/main.js";
+            resources_path = try arena_alloc.alloc(u8, exe_dir.len + resources_suffix.len);
+            @memcpy(resources_path[0..exe_dir.len], exe_dir);
+            @memcpy(resources_path[exe_dir.len..], resources_suffix);
             argv[0] = "./bun";
             argv[1] = resources_path;
         },
