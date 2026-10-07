@@ -189,8 +189,10 @@ pub fn main() !void {
 
     // Handle platform-specific environment setup
     if (builtin.os.tag == .linux) {
+        // No `defer env_map.deinit()` here: it would run at the end of this block,
+        // freeing the map before spawn() reads it via child_process.env_map.
+        // The launcher exits right after the child does, so the OS reclaims it.
         env_map = try std.process.getEnvMap(alloc);
-        defer env_map.deinit();
         // Check for CEF libraries that need LD_PRELOAD
         const cef_lib_path = try std.fs.path.join(arena_alloc, &.{ exe_dir, "libcef.so" });
         const swiftshader_lib_path = try std.fs.path.join(arena_alloc, &.{ exe_dir, "libvk_swiftshader.so" });
@@ -233,8 +235,10 @@ pub fn main() !void {
 
     } else if (builtin.os.tag == .windows) {
         // On Windows, get environment and set ICU_DATA for external ICU data
+        // No `defer env_map.deinit()` here: it would run at the end of this block,
+        // freeing the map before spawn() reads it via child_process.env_map.
+        // The launcher exits right after the child does, so the OS reclaims it.
         env_map = try std.process.getEnvMap(alloc);
-        defer env_map.deinit();
         try env_map.put("ICU_DATA", exe_dir);
         child_process.env_map = &env_map;
     }
